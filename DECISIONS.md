@@ -101,6 +101,48 @@ directory with `0600` permissions. Connections can also be set to ask for the pa
 - **TLS** uses `native-tls`, i.e. Security.framework on macOS and OpenSSL on Linux, so the system
   trust store and its updates are used. Modes mirror libpq (`disable` … `verify-full`).
 
+## Query plans
+
+EXPLAIN output differs by engine and version: MySQL prints a text tree or one of two JSON shapes,
+MariaDB and PostgreSQL print JSON, and SQLite's `EXPLAIN QUERY PLAN` returns rows without numbers.
+A separate EXPLAIN lab captured 387 outputs from 18 servers to pin these down.
+[docs/query-plans.md](docs/query-plans.md) describes each format and how times and bars are
+derived.
+
+- **One model.** Every parser fills the same tree of steps, and inclusive time, self time and the
+  estimate ratio are derived in core, so the views never branch on the engine. Parsers recognize
+  their format from the result's shape, so a hand-typed `EXPLAIN` gets the plan view too.
+- **Which statement to send** is a table of rules by engine, mode and minimum version. MySQL 8.4
+  and later explain through JSON format version 2 rather than TREE text, because it keeps tables,
+  indexes and conditions as separate fields at full precision. That costs a statement that sets
+  the format and one that puts the session's own setting back.
+- **Explain Analyze never writes.** It shows the estimated plan, with a note, for any statement but
+  a query and where the server can't measure (MySQL before 8.0.18, SQLite before 3.42). The rest
+  runs read-only, because a query can still write through a function such as `nextval`. A session
+  with its own transaction open is refused, because the read-only setting can't reach it. The
+  driver prepares the plan request first, so the server refuses a second statement the tokenizer
+  missed. `Connection::explain` holds the connection from the setup to the reset, so another tab's
+  statement never lands in between, and a failed reset is shown in Messages.
+- **The statement's time is the longest any step reports**, not the root's: MySQL 8.0.18 can report
+  microseconds for a limit above a union that took milliseconds to materialize.
+
+## Explain Analyze on SQLite
+
+SQLite has no `EXPLAIN ANALYZE`, but once a statement has run, `sqlite3_stmt_scanstatus_v2` reports
+the loops, rows visited, estimate and counter ticks of each `EXPLAIN QUERY PLAN` step.
+
+- **Build flag.** The API exists only when SQLite is compiled with `SQLITE_ENABLE_STMT_SCANSTATUS`.
+  `.cargo/config.toml` passes it to every cargo command in the repository, and a build without it
+  fails to link. The connection's check of the compile option only covers a library compiled
+  without collection, where Explain Analyze falls back to the estimate.
+- **Collection only while measuring.** With collection on, SQLite reads the counter around every
+  instruction: a self-join of `order_details` ran about 4% slower (7.5 ms against 7.2 ms on an M5
+  Max). A connection turns it off when it opens and on only around the measured statement.
+- **A second write guard.** The driver refuses any statement that `sqlite3_stmt_readonly` reports
+  as writing, so one the request rules misread still never runs.
+- **Times are shares of ticks.** SQLite doesn't time steps. A step's time is its share of the
+  statement's ticks, scaled to the time spent in `sqlite3_step`, and the plan's format says so.
+
 ## Scope cuts
 
 - **Redis and MongoDB** (stretch goals) were not implemented. They aren't relational: they need a key

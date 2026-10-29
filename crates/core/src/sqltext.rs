@@ -231,12 +231,18 @@ pub fn is_keyword(word: &str) -> bool {
     KEYWORDS.binary_search(&upper.as_str()).is_ok()
 }
 
+/// PostgreSQL, MySQL and SQLite read every non-ASCII character, a no-break space included, as part
+/// of an identifier, and only ASCII as whitespace.
 fn is_ident_start(c: char) -> bool {
-    c.is_alphabetic() || c == '_'
+    c.is_ascii_alphabetic() || c == '_' || !c.is_ascii()
 }
 
 fn is_ident_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || c == '$'
+    c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii()
+}
+
+fn is_space(c: char) -> bool {
+    c.is_ascii_whitespace() || c == '\x0b'
 }
 
 /// Tokenizes `src`. Never fails: unterminated strings/comments run to the end of input.
@@ -249,16 +255,16 @@ pub fn tokenize(src: &str, dialect: Dialect) -> Vec<Token> {
     while i < len {
         let start = i;
         let c = next_char(i).unwrap();
-        let kind = if c.is_whitespace() {
-            while let Some(c) = next_char(i).filter(|c| c.is_whitespace()) {
+        let kind = if is_space(c) {
+            while let Some(c) = next_char(i).filter(|c| is_space(*c)) {
                 i += c.len_utf8();
             }
             TokenKind::Whitespace
-        } else if src[i..].starts_with("--") || (dialect == Dialect::MySql && c == '#') {
+        } else if line_comment(src, i, dialect) {
             i = src[i..].find('\n').map_or(len, |p| i + p);
             TokenKind::Comment
         } else if src[i..].starts_with("/*") {
-            i = src[i + 2..].find("*/").map_or(len, |p| i + 2 + p + 2);
+            i = block_comment_end(src, i, dialect);
             TokenKind::Comment
         } else if c == '\'' || (dialect == Dialect::MySql && c == '"') {
             i = scan_quoted(src, i, c, dialect == Dialect::MySql);
@@ -316,6 +322,43 @@ pub fn tokenize(src: &str, dialect: Dialect) -> Vec<Token> {
         tokens.push(Token { kind, start, end: i });
     }
     tokens
+}
+
+/// MySQL starts a `--` comment only before whitespace or a control character; `1 --1` is
+/// arithmetic there.
+fn line_comment(src: &str, i: usize, dialect: Dialect) -> bool {
+    match dialect {
+        Dialect::MySql => {
+            src[i..].starts_with('#')
+                || (src[i..].starts_with("--")
+                    && src[i + 2..].chars().next().is_none_or(|c| c.is_ascii_whitespace() || c.is_ascii_control()))
+        }
+        _ => src[i..].starts_with("--"),
+    }
+}
+
+/// The end of the block comment that opens at `open`. PostgreSQL nests them.
+fn block_comment_end(src: &str, open: usize, dialect: Dialect) -> usize {
+    let bytes = src.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    while i + 1 < bytes.len() {
+        match (bytes[i], bytes[i + 1]) {
+            (b'/', b'*') if depth == 0 || dialect == Dialect::Postgres => {
+                depth += 1;
+                i += 2;
+            }
+            (b'*', b'/') => {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    src.len()
 }
 
 fn scan_quoted(src: &str, open: usize, quote: char, backslash_escapes: bool) -> usize {
@@ -461,9 +504,9 @@ pub fn statement_at(src: &str, cursor: usize, dialect: Dialect) -> Option<Statem
     best.or_else(|| stmts.into_iter().next())
 }
 
-/// Removes a trailing `;` and whitespace.
+/// Removes a trailing `;` and ASCII whitespace; a trailing no-break space belongs to the last name.
 pub fn trim_statement(sql: &str) -> &str {
-    sql.trim().trim_end_matches(';').trim_end()
+    sql.trim_start().trim_end_matches(is_space).trim_end_matches(';').trim_end_matches(is_space)
 }
 
 /// True for statements that produce rows (used to decide on row limits).
@@ -536,6 +579,20 @@ mod tests {
     }
 
     #[test]
+    fn split_follows_each_servers_comments() {
+        assert_eq!(texts("select 1 --1 ; delete from t", Dialect::MySql), vec!["select 1 --1", "delete from t"]);
+        assert_eq!(texts("select 1 -- c ; delete from t", Dialect::MySql), vec!["select 1"]);
+        assert_eq!(texts("select 1 --1 ; delete from t", Dialect::Postgres), vec!["select 1"]);
+        let nested = "/* /* */ select 1 */ delete from t; select 2";
+        assert_eq!(texts(nested, Dialect::Postgres), vec!["delete from t", "select 2"]);
+        assert_eq!(texts("/* /* */ select 1", Dialect::MySql), vec!["select 1"]);
+        let nbsp = "select 1 --\u{a0} from t; delete from t";
+        assert_eq!(texts(nbsp, Dialect::MySql), vec!["select 1 --\u{a0} from t", "delete from t"]);
+        let dollar = "select 1 as a€$x$; delete from t; select '$x$'";
+        assert_eq!(texts(dollar, Dialect::Postgres), vec!["select 1 as a€$x$", "delete from t", "select '$x$'"]);
+    }
+
+    #[test]
     fn split_mysql_delimiter() {
         let src = "DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END //\nDELIMITER ;\nSELECT 3;";
         assert_eq!(texts(src, Dialect::MySql), vec!["CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END", "SELECT 3"]);
@@ -559,5 +616,10 @@ mod tests {
         assert!(is_query("WITH x AS (select 1) select * from x"));
         assert!(!is_query("update t set a = 1"));
         assert_eq!(trim_statement(" select 1 ; "), "select 1");
+        assert_eq!(
+            trim_statement("\u{a0}delete from t\u{a0} ;\n"),
+            "delete from t\u{a0}",
+            "a trailing no-break space is part of the name"
+        );
     }
 }

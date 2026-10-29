@@ -34,6 +34,8 @@ pub enum Icon {
     Trash,
     Lock,
     Copy,
+    Plan,
+    Stopwatch,
 }
 
 /// Maps a 16×16 design grid onto `rect`.
@@ -246,6 +248,21 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Copy => {
             painter.rect_stroke(g.r(5.0, 5.0, 13.5, 13.5), CornerRadius::same(2), s, StrokeKind::Middle);
             line(vec![g.p(2.5, 10.5), g.p(2.5, 2.5), g.p(10.5, 2.5)]);
+        }
+        Icon::Plan => {
+            // A step with two steps below it.
+            painter.rect_filled(g.r(1.5, 2.0, 8.5, 5.5), CornerRadius::same(1), color);
+            line(vec![g.p(4.0, 5.5), g.p(4.0, 12.5), g.p(7.0, 12.5)]);
+            line(vec![g.p(4.0, 8.5), g.p(7.0, 8.5)]);
+            painter.rect_stroke(g.r(7.5, 7.0, 14.5, 10.0), CornerRadius::same(1), s, StrokeKind::Middle);
+            painter.rect_stroke(g.r(7.5, 11.0, 14.5, 14.0), CornerRadius::same(1), s, StrokeKind::Middle);
+        }
+        Icon::Stopwatch => {
+            painter.circle_stroke(g.p(8.0, 9.0), g.len(5.2), s);
+            line(vec![g.p(6.5, 1.8), g.p(9.5, 1.8)]);
+            line(vec![g.p(8.0, 1.8), g.p(8.0, 3.8)]);
+            line(vec![g.p(8.0, 9.0), g.p(10.4, 6.6)]);
+            painter.circle_filled(g.p(8.0, 9.0), g.len(0.9), color);
         }
     }
 }

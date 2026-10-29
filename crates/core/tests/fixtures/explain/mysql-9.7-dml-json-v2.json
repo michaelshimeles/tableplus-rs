@@ -1,0 +1,166 @@
+{
+  "query": "update `northwind`.`products` set `northwind`.`products`.`unit_price` = (`northwind`.`products`.`unit_price` * 1.05) where ((`o`.`order_id` = `od`.`order_id`) and (`northwind`.`products`.`category_id` = `c`.`category_id`) and (`c`.`category_name` = 'Beverages') and (`od`.`product_id` = `northwind`.`products`.`product_id`) and (`northwind`.`products`.`discontinued` = 0) and (`o`.`order_date` >= DATE'1998-01-01'))",
+  "query_plan": {
+    "inputs": [
+      {
+        "inputs": [
+          {
+            "inputs": [
+              {
+                "inputs": [
+                  {
+                    "alias": "c",
+                    "operation": "Table scan on c",
+                    "table_name": "categories",
+                    "access_type": "table",
+                    "schema_name": "northwind",
+                    "used_columns": [
+                      "category_id",
+                      "category_name"
+                    ],
+                    "estimated_rows": 8.0,
+                    "estimated_total_cost": 1.05
+                  }
+                ],
+                "condition": "(c.category_name = 'Beverages')",
+                "operation": "Filter: (c.category_name = 'Beverages')",
+                "access_type": "filter",
+                "estimated_rows": 1.0,
+                "filter_columns": [
+                  "c.category_name"
+                ],
+                "estimated_total_cost": 1.05
+              },
+              {
+                "inputs": [
+                  {
+                    "covering": false,
+                    "operation": "Index lookup on products using idx_products_category_id (category_id = c.category_id)",
+                    "index_name": "idx_products_category_id",
+                    "table_name": "products",
+                    "access_type": "index",
+                    "key_columns": [
+                      "category_id"
+                    ],
+                    "schema_name": "northwind",
+                    "used_columns": [
+                      "product_id",
+                      "product_name",
+                      "supplier_id",
+                      "category_id",
+                      "quantity_per_unit",
+                      "unit_price",
+                      "units_in_stock",
+                      "units_on_order",
+                      "reorder_level",
+                      "discontinued"
+                    ],
+                    "estimated_rows": 9.625,
+                    "lookup_condition": "category_id = c.category_id",
+                    "index_access_type": "index_lookup",
+                    "lookup_references": [
+                      "northwind.c.category_id"
+                    ],
+                    "estimated_total_cost": 0.8462500014342369
+                  }
+                ],
+                "condition": "(products.discontinued = 0)",
+                "operation": "Filter: (products.discontinued = 0)",
+                "access_type": "filter",
+                "estimated_rows": 0.9625000143423676,
+                "filter_columns": [
+                  "northwind.products.discontinued"
+                ],
+                "estimated_total_cost": 0.8462500014342369
+              }
+            ],
+            "join_type": "inner join",
+            "operation": "Nested loop inner join",
+            "access_type": "join",
+            "estimated_rows": 0.9625000143423676,
+            "join_algorithm": "nested_loop",
+            "estimated_total_cost": 2.7625
+          },
+          {
+            "inputs": [
+              {
+                "alias": "od",
+                "covering": true,
+                "operation": "Covering index lookup on od using idx_order_details_product_id (product_id = products.product_id)",
+                "index_name": "idx_order_details_product_id",
+                "table_name": "order_details",
+                "access_type": "index",
+                "key_columns": [
+                  "product_id"
+                ],
+                "schema_name": "northwind",
+                "used_columns": [
+                  "order_id",
+                  "product_id"
+                ],
+                "estimated_rows": 27.98701286315918,
+                "lookup_condition": "product_id = products.product_id",
+                "index_access_type": "index_lookup",
+                "lookup_references": [
+                  "northwind.products.product_id"
+                ],
+                "estimated_total_cost": 3.1626806108347174
+              },
+              {
+                "inputs": [
+                  {
+                    "alias": "o",
+                    "covering": false,
+                    "operation": "Single-row index lookup on o using PRIMARY (order_id = od.order_id)",
+                    "index_name": "PRIMARY",
+                    "table_name": "orders",
+                    "access_type": "index",
+                    "key_columns": [
+                      "order_id"
+                    ],
+                    "schema_name": "northwind",
+                    "used_columns": [
+                      "order_id",
+                      "order_date"
+                    ],
+                    "estimated_rows": 1.0,
+                    "lookup_condition": "order_id = od.order_id",
+                    "index_access_type": "index_lookup",
+                    "lookup_references": [
+                      "northwind.od.order_id"
+                    ],
+                    "estimated_total_cost": 2.3435595104235953
+                  }
+                ],
+                "condition": "(o.order_date >= DATE'1998-01-01')",
+                "operation": "Filter: (o.order_date >= DATE'1998-01-01')",
+                "access_type": "filter",
+                "estimated_rows": 0.33329999446868896,
+                "filter_columns": [
+                  "o.order_date"
+                ],
+                "estimated_total_cost": 2.3435595104235953
+              }
+            ],
+            "join_type": "inner join",
+            "operation": "Nested loop inner join",
+            "access_type": "join",
+            "estimated_rows": 9.328071232486081,
+            "join_algorithm": "nested_loop",
+            "estimated_total_cost": 12.69575696769832
+          }
+        ],
+        "join_type": "semijoin",
+        "operation": "Nested loop semijoin (FirstMatch)",
+        "access_type": "join",
+        "estimated_rows": 8.97826869505448,
+        "join_algorithm": "nested_loop",
+        "semijoin_strategy": "firstmatch",
+        "estimated_total_cost": 3.9057057164782742
+      }
+    ],
+    "operation": "Update products (buffered)"
+  },
+  "query_type": "update",
+  "json_schema_version": "2.0"
+}

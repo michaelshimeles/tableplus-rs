@@ -65,6 +65,9 @@ impl AppMenu {
                 &PredefinedMenuItem::separator(),
                 &item("run", "Run Current Statement", Some("CmdOrCtrl+Enter")),
                 &item("run_all", "Run All", Some("CmdOrCtrl+Shift+Enter")),
+                &PredefinedMenuItem::separator(),
+                &item("explain", "Explain", Some("CmdOrCtrl+E")),
+                &item("explain_analyze", "Explain Analyze", Some("CmdOrCtrl+Shift+E")),
             ],
         )
         .ok()?;
@@ -117,6 +120,8 @@ impl AppMenu {
                 "filter" => sc.find = true,
                 "run" => sc.run = true,
                 "run_all" => sc.run_all = true,
+                "explain" => sc.explain = true,
+                "explain_analyze" => sc.explain_analyze = true,
                 "next_tab" => sc.next_tab = true,
                 "prev_tab" => sc.prev_tab = true,
                 "theme_system" => *theme = Some(ThemeChoice::System),

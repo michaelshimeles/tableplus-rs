@@ -236,6 +236,54 @@ pub fn fmt_duration(d: Duration) -> String {
     }
 }
 
+/// Plan row counts: `287`, `127,044`, `33.7`, `1.95`, `0.31`, `12.3M`.
+pub fn fmt_rows(n: f64) -> String {
+    if n >= 10_000_000.0 {
+        format!("{:.1}M", n / 1_000_000.0)
+    } else if n >= 100.0 || n.fract() == 0.0 {
+        fmt_count(n.round() as u64)
+    } else if n >= 10.0 {
+        format!("{n:.1}")
+    } else {
+        let s = format!("{n:.2}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+/// Plan step times: `4.68 ms`, `61.2 ms`, `578 µs`, `1.24 s`.
+pub fn fmt_ms(ms: f64) -> String {
+    if ms >= 1000.0 {
+        format!("{:.2} s", ms / 1000.0)
+    } else if ms >= 100.0 {
+        format!("{ms:.0} ms")
+    } else if ms >= 10.0 {
+        format!("{ms:.1} ms")
+    } else if ms >= 1.0 {
+        format!("{ms:.2} ms")
+    } else if ms >= 0.0005 {
+        format!("{:.0} µs", ms * 1000.0)
+    } else if ms > 0.0 {
+        "<1 µs".into()
+    } else {
+        "0".into()
+    }
+}
+
+/// `67`, `4,539`: how many times off an estimate is.
+pub fn fmt_factor(f: f64) -> String {
+    if f >= 1000.0 {
+        fmt_count(f.round() as u64)
+    } else if f >= 10.0 {
+        format!("{f:.0}")
+    } else {
+        format!("{f:.1}").trim_end_matches(".0").to_string()
+    }
+}
+
+pub fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
+}
+
 /// A modal dialog with the app's frame (padding, rounded corners, shadow).
 pub fn modal(ctx: &egui::Context, id: impl std::hash::Hash + std::fmt::Debug) -> egui::Modal {
     let style = ctx.global_style();
@@ -262,5 +310,20 @@ mod tests {
         assert_eq!(fmt_count(2_000_000), "2,000,000");
         assert_eq!(fmt_duration(Duration::from_millis(23)), "23 ms");
         assert_eq!(fmt_duration(Duration::from_millis(1500)), "1.50 s");
+        assert_eq!(fmt_rows(287.0), "287");
+        assert_eq!(fmt_rows(127_044.0), "127,044");
+        assert_eq!(fmt_rows(33.7), "33.7");
+        assert_eq!(fmt_rows(1.95), "1.95");
+        assert_eq!(fmt_rows(0.31), "0.31");
+        assert_eq!(fmt_rows(0.889), "0.89");
+        assert_eq!(fmt_rows(0.0), "0");
+        assert_eq!(fmt_ms(4.68), "4.68 ms");
+        assert_eq!(fmt_ms(0.578), "578 µs");
+        assert_eq!(fmt_ms(244e-6), "<1 µs");
+        assert_eq!(fmt_ms(1240.0), "1.24 s");
+        assert_eq!(fmt_factor(67.2), "67");
+        assert_eq!(fmt_factor(1.18), "1.2");
+        assert_eq!(fmt_factor(3.0), "3");
+        assert_eq!(fmt_factor(4539.0), "4,539");
     }
 }

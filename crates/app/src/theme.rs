@@ -61,6 +61,30 @@ pub struct Palette {
     pub editor_bg: Color32,
     pub gutter_text: Color32,
     pub field_bg: Color32,
+    /// Query plan time bar: time including the steps below, and the step's own time.
+    pub plan_bar: Color32,
+    pub plan_bar_self: Color32,
+    pub plan_bar_track: Color32,
+    /// Bar for estimate-only plans, which show relative cost instead of time, and its paler
+    /// extension over steps below whose cost the step doesn't count.
+    pub plan_cost: Color32,
+    pub plan_cost_below: Color32,
+    /// Where the first row came out, on the time bar.
+    pub plan_tick: Color32,
+    /// Plan tree indent guides, and the guide of the selected step's subtree.
+    pub plan_guide: Color32,
+    pub plan_guide_active: Color32,
+    /// Flame chart own time: too small a share of the statement to matter, then notable through
+    /// to the largest.
+    pub plan_heat_low: Color32,
+    pub plan_heat_mid: Color32,
+    pub plan_heat_high: Color32,
+    /// Plan graph: its canvas and dot grid, the step cards and their borders, and the edges.
+    pub plan_canvas: Color32,
+    pub plan_dots: Color32,
+    pub plan_card: Color32,
+    pub plan_card_border: Color32,
+    pub plan_edge: Color32,
 }
 
 const fn hex(rgb: u32) -> Color32 {
@@ -101,6 +125,22 @@ pub static LIGHT: Palette = Palette {
     editor_bg: hex(0xFFFFFF),
     gutter_text: hex(0xA8A8AD),
     field_bg: hex(0xFFFFFF),
+    plan_bar: hex(0xBDD5FB),
+    plan_bar_self: hex(0x2F7CF6),
+    plan_bar_track: hex(0xECEEF2),
+    plan_cost: hex(0xA9B6CC),
+    plan_cost_below: hex(0xD3DAE5),
+    plan_tick: hex(0x1D1D1F),
+    plan_guide: hex(0xE1E3E8),
+    plan_guide_active: hex(0x8DB4F6),
+    plan_heat_low: hex(0x8FB9F7),
+    plan_heat_mid: hex(0xF4C870),
+    plan_heat_high: hex(0xF49A95),
+    plan_canvas: hex(0xF5F6F8),
+    plan_dots: hex(0xDDDFE4),
+    plan_card: hex(0xFFFFFF),
+    plan_card_border: hex(0xD8DADF),
+    plan_edge: hex(0xB9BEC8),
 };
 
 pub static DARK: Palette = Palette {
@@ -137,6 +177,22 @@ pub static DARK: Palette = Palette {
     editor_bg: hex(0x1C1C1E),
     gutter_text: hex(0x5E5E63),
     field_bg: hex(0x1F1F21),
+    plan_bar: hex(0x2A4877),
+    plan_bar_self: hex(0x4C95FF),
+    plan_bar_track: hex(0x2B2B2E),
+    plan_cost: hex(0x56627A),
+    plan_cost_below: hex(0x3F4555),
+    plan_tick: hex(0xF2F2F4),
+    plan_guide: hex(0x343438),
+    plan_guide_active: hex(0x3F69B0),
+    plan_heat_low: hex(0x3866AE),
+    plan_heat_mid: hex(0x8A6422),
+    plan_heat_high: hex(0x9B3B37),
+    plan_canvas: hex(0x1C1C1E),
+    plan_dots: hex(0x2D2D31),
+    plan_card: hex(0x28282B),
+    plan_card_border: hex(0x3D3D42),
+    plan_edge: hex(0x585960),
 };
 
 pub fn palette(ui: &Ui) -> &'static Palette {

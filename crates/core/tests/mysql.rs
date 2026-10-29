@@ -8,10 +8,15 @@ use std::time::Duration;
 
 use common::*;
 use tableplus_core::config::SslMode;
-use tableplus_core::driver;
+use tableplus_core::driver::{self, DynConnection};
 use tableplus_core::model::{ConstraintKind, ObjectKind};
+use tableplus_core::plan::{self, ExplainMode};
 use tableplus_core::sqlgen::{self, Filter, FilterOp, SortKey};
-use tableplus_core::{StatementResult, Value};
+use tableplus_core::{Flavor, StatementResult, Value};
+
+/// Paid orders per country: a join, a grouping and a sort.
+const JOIN: &str = "SELECT u.country, count(*) FROM orders o JOIN users u ON u.id = o.user_id \
+                    WHERE o.status = 'paid' GROUP BY u.country ORDER BY 2 DESC";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_metadata() {
@@ -19,6 +24,8 @@ async fn mysql_metadata() {
         return;
     };
     assert!(conn.server_version().starts_with("MySQL 8.4"), "{}", conn.server_version());
+    let info = conn.server_info();
+    assert_eq!((info.flavor, info.version.major, info.version.minor), (Flavor::MySql, 8, 4), "{info}");
     assert_eq!(conn.default_schema(), "shop");
     let schemas = conn.list_schemas().await.unwrap();
     assert_eq!(schemas, vec!["analytics", "shop"]);
@@ -163,6 +170,8 @@ async fn mariadb_metadata_and_editing() {
         return;
     };
     assert!(conn.server_version().starts_with("MariaDB 11"), "{}", conn.server_version());
+    let info = conn.server_info();
+    assert_eq!((info.flavor, info.version.major), (Flavor::MariaDb, 11), "{info}");
     let objects = conn.list_objects().await.unwrap();
     assert!(objects.iter().any(|o| o.name == "vip_customers" && o.kind == ObjectKind::View));
     let customers = conn.table_structure("shop", "customers").await.unwrap();
@@ -188,6 +197,135 @@ async fn mysql_streaming() {
     timed(
         "mysql streaming 250k rows",
         exercise_streaming(&conn, "SELECT * FROM analytics.events WHERE id <= 250000", 250_000),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_explain_plans() {
+    let Some(conn) = connect_or_skip(&mysql_config(), &password()).await else {
+        return;
+    };
+    exercise_explain(&conn, JOIN, "UPDATE orders SET total = 0", "SELECT COUNT(*), SUM(total) FROM orders").await;
+    exercise_explain_one_statement(&conn, "SET @tableplus_second = 1", "SELECT @tableplus_second").await;
+    conn.query("SET explain_json_format_version = 1", None).await.unwrap();
+    explain(&conn, JOIN, ExplainMode::Analyze).await;
+    let version = driver::scalar(conn.as_ref(), "SELECT @@SESSION.explain_json_format_version").await.unwrap();
+    assert_eq!(version.as_deref(), Some("1"), "the session's own JSON format is put back");
+    exercise_read_only_explain(
+        &conn,
+        "SELECT SLEEP(0.5)",
+        "UPDATE orders SET note = note WHERE id = 1",
+        "SET SESSION transaction_read_only = 1",
+    )
+    .await;
+}
+
+/// With autocommit off, Explain Analyze opens no transaction that outlives it, and refuses once a
+/// statement has opened one. Neither `completion_type` nor `LOCK TABLES` changes what the session
+/// is left with. `touch` writes to `table`, and `other` is a second table.
+async fn exercise_explain_transactions(conn: &DynConnection, touch: &str, table: &str, other: &str) {
+    exercise_explain_in_transaction(conn, "START TRANSACTION", touch).await;
+    let autocommit = async || driver::scalar(conn.as_ref(), "SELECT @@SESSION.autocommit").await.unwrap();
+    explain(conn, "SELECT 1", ExplainMode::Analyze).await;
+    assert_eq!(autocommit().await.as_deref(), Some("1"));
+    conn.query("SET autocommit = 0", None).await.unwrap();
+    explain(conn, "SELECT 1", ExplainMode::Analyze).await;
+    assert_eq!(autocommit().await.as_deref(), Some("0"));
+    conn.query(touch, None).await.unwrap_or_else(|e| panic!("no read-only transaction is left open: {e:#}"));
+    exercise_explain_in_transaction(conn, "SELECT 1", touch).await;
+    conn.query("SET autocommit = 1", None).await.unwrap();
+
+    let sql_mode = driver::scalar(conn.as_ref(), "SELECT @@SESSION.sql_mode").await.unwrap().unwrap_or_default();
+    conn.query("SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'", None).await.unwrap();
+    for mode in [ExplainMode::Estimate, ExplainMode::Analyze] {
+        explain(conn, r"SELECT '\' AS slash, '?:named' AS txt", mode).await;
+    }
+    conn.query(&format!("SET SESSION sql_mode = '{sql_mode}'"), None).await.unwrap();
+
+    for completion in ["1", "2"] {
+        conn.query(&format!("SET completion_type = {completion}"), None).await.unwrap();
+        explain(conn, "SELECT 1", ExplainMode::Analyze).await;
+        conn.query(touch, None).await.unwrap_or_else(|e| panic!("completion_type {completion}: {e:#}"));
+        conn.query("SET completion_type = 0", None).await.unwrap();
+    }
+
+    conn.query(&format!("LOCK TABLES {table} READ"), None).await.unwrap();
+    explain(conn, &format!("SELECT COUNT(*) FROM {table}"), ExplainMode::Analyze).await;
+    let err = conn.query(&format!("SELECT 1 FROM {other} LIMIT 1"), None).await.unwrap_err().to_string();
+    assert!(err.contains("was not locked"), "the session still holds its table locks: {err}");
+    conn.query("UNLOCK TABLES", None).await.unwrap();
+}
+
+/// A statement over half of `max_allowed_packet` explains, and the connection stays open.
+async fn exercise_explain_large_statement(conn: &DynConnection) {
+    let packet = driver::scalar(conn.as_ref(), "SELECT @@max_allowed_packet").await.unwrap().unwrap();
+    let packet = packet.parse::<usize>().unwrap();
+    let select = |length: usize| format!("SELECT LENGTH('{}')", "a".repeat(length));
+    explain(conn, &select(packet * 6 / 10), ExplainMode::Estimate).await;
+    assert!(conn.query("SELECT 1", None).await.is_ok(), "the connection stays open");
+
+    // A plan request one byte short of the limit leaves no room for the query packet's command byte.
+    let server = conn.server_info();
+    let prefix = plan::request(&server, &select(0), ExplainMode::Estimate).unwrap().explain.sql().len();
+    let req = plan::request(&server, &select(packet - 1 - prefix), ExplainMode::Estimate).unwrap();
+    assert_eq!(req.explain.sql().len(), packet - 1);
+    let err = conn.explain(&req).await.unwrap_err().to_string();
+    assert!(err.contains("max_allowed_packet"), "{err}");
+    assert!(conn.query("SELECT 1", None).await.is_ok(), "the connection stays open");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_explain_large_statement() {
+    let Some(conn) = connect_or_skip(&mysql_config(), &password()).await else {
+        return;
+    };
+    exercise_explain_large_statement(&conn).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mariadb_explain_large_statement() {
+    let Some(conn) = connect_or_skip(&mariadb_config(), &password()).await else {
+        return;
+    };
+    exercise_explain_large_statement(&conn).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_explain_transactions() {
+    let Some(conn) = connect_or_skip(&mysql_config(), &password()).await else {
+        return;
+    };
+    exercise_explain_transactions(&conn, "UPDATE orders SET note = note WHERE id = 1", "orders", "users").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mariadb_explain_transactions() {
+    let Some(conn) = connect_or_skip(&mariadb_config(), &password()).await else {
+        return;
+    };
+    exercise_explain_transactions(&conn, "UPDATE invoices SET paid = paid WHERE id = 1", "invoices", "customers").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mariadb_explain_plans() {
+    let Some(conn) = connect_or_skip(&mariadb_config(), &password()).await else {
+        return;
+    };
+    exercise_explain(
+        &conn,
+        "SELECT c.vip, COUNT(*), SUM(i.amount) FROM invoices i JOIN customers c ON c.id = i.customer_id \
+         WHERE i.paid GROUP BY c.vip ORDER BY 3 DESC",
+        "UPDATE invoices SET amount = 0",
+        "SELECT COUNT(*), SUM(amount) FROM invoices",
+    )
+    .await;
+    exercise_explain_one_statement(&conn, "SET @tableplus_second = 1", "SELECT @tableplus_second").await;
+    exercise_read_only_explain(
+        &conn,
+        "SELECT SLEEP(0.5)",
+        "UPDATE invoices SET paid = paid WHERE id = 1",
+        "SET SESSION tx_read_only = 1",
     )
     .await;
 }

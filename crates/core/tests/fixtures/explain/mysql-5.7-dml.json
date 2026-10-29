@@ -1,0 +1,134 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "table": {
+      "update": true,
+      "table_name": "products",
+      "access_type": "index",
+      "key": "PRIMARY",
+      "used_key_parts": [
+        "product_id"
+      ],
+      "key_length": "2",
+      "rows_examined_per_scan": 77,
+      "filtered": "100.00",
+      "attached_condition": "((`northwind`.`products`.`discontinued` = 0) and <in_optimizer>(`northwind`.`products`.`category_id`,<exists>(<primary_index_lookup>(<cache>(`northwind`.`products`.`category_id`) in categories on PRIMARY where ((`northwind`.`c`.`category_name` = 'Beverages') and (<cache>(`northwind`.`products`.`category_id`) = `northwind`.`c`.`category_id`))))) and exists(/* select#3 */ select 1 from `northwind`.`order_details` `od` join `northwind`.`orders` `o` where ((`northwind`.`o`.`order_id` = `northwind`.`od`.`order_id`) and (`northwind`.`od`.`product_id` = `northwind`.`products`.`product_id`) and (`northwind`.`o`.`order_date` >= '1998-01-01'))))",
+      "attached_subqueries": [
+        {
+          "dependent": true,
+          "cacheable": false,
+          "query_block": {
+            "select_id": 3,
+            "cost_info": {
+              "query_cost": "40.20"
+            },
+            "nested_loop": [
+              {
+                "table": {
+                  "table_name": "od",
+                  "access_type": "ref",
+                  "possible_keys": [
+                    "PRIMARY",
+                    "idx_order_details_product_id"
+                  ],
+                  "key": "idx_order_details_product_id",
+                  "used_key_parts": [
+                    "product_id"
+                  ],
+                  "key_length": "2",
+                  "ref": [
+                    "northwind.products.product_id"
+                  ],
+                  "rows_examined_per_scan": 27,
+                  "rows_produced_per_join": 27,
+                  "filtered": "100.00",
+                  "using_index": true,
+                  "cost_info": {
+                    "read_cost": "1.02",
+                    "eval_cost": "5.60",
+                    "prefix_cost": "6.62",
+                    "data_read_per_join": "447"
+                  },
+                  "used_columns": [
+                    "order_id",
+                    "product_id"
+                  ]
+                }
+              },
+              {
+                "table": {
+                  "table_name": "o",
+                  "access_type": "eq_ref",
+                  "possible_keys": [
+                    "PRIMARY"
+                  ],
+                  "key": "PRIMARY",
+                  "used_key_parts": [
+                    "order_id"
+                  ],
+                  "key_length": "2",
+                  "ref": [
+                    "northwind.od.order_id"
+                  ],
+                  "rows_examined_per_scan": 1,
+                  "rows_produced_per_join": 9,
+                  "filtered": "33.33",
+                  "cost_info": {
+                    "read_cost": "27.99",
+                    "eval_cost": "1.87",
+                    "prefix_cost": "40.20",
+                    "data_read_per_join": "6K"
+                  },
+                  "used_columns": [
+                    "order_id",
+                    "order_date"
+                  ],
+                  "attached_condition": "(`northwind`.`o`.`order_date` >= '1998-01-01')"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "dependent": true,
+          "cacheable": false,
+          "query_block": {
+            "select_id": 2,
+            "cost_info": {
+              "query_cost": "1.20"
+            },
+            "table": {
+              "table_name": "c",
+              "access_type": "unique_subquery",
+              "possible_keys": [
+                "PRIMARY"
+              ],
+              "key": "PRIMARY",
+              "used_key_parts": [
+                "category_id"
+              ],
+              "key_length": "2",
+              "ref": [
+                "func"
+              ],
+              "rows_examined_per_scan": 1,
+              "rows_produced_per_join": 0,
+              "filtered": "12.50",
+              "cost_info": {
+                "read_cost": "1.00",
+                "eval_cost": "0.03",
+                "prefix_cost": "1.20",
+                "data_read_per_join": "10"
+              },
+              "used_columns": [
+                "category_id",
+                "category_name"
+              ],
+              "attached_condition": "((`northwind`.`c`.`category_name` = 'Beverages') and (<cache>(`northwind`.`products`.`category_id`) = `northwind`.`c`.`category_id`))"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

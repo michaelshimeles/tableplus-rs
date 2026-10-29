@@ -10,8 +10,13 @@ use common::*;
 use tableplus_core::config::SslMode;
 use tableplus_core::driver;
 use tableplus_core::model::{ConstraintKind, ObjectKind};
+use tableplus_core::plan::{self, ExplainMode};
 use tableplus_core::sqlgen::{self, Filter, FilterOp, SortKey};
-use tableplus_core::{StatementResult, Value};
+use tableplus_core::{Flavor, StatementResult, Value};
+
+/// Paid orders per country: a join, a grouping and a sort.
+const JOIN: &str = "SELECT u.country, count(*) FROM orders o JOIN users u ON u.id = o.user_id \
+                    WHERE o.status = 'paid' GROUP BY u.country ORDER BY 2 DESC";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn metadata() {
@@ -19,6 +24,8 @@ async fn metadata() {
         return;
     };
     assert!(conn.server_version().starts_with("PostgreSQL 17"), "{}", conn.server_version());
+    let info = conn.server_info();
+    assert_eq!((info.flavor, info.version.major), (Flavor::Postgres, 17), "{info}");
     assert_eq!(conn.database(), "shop");
     assert!(conn.list_databases().await.unwrap().contains(&"shop".to_string()));
     let schemas = conn.list_schemas().await.unwrap();
@@ -203,4 +210,48 @@ async fn streaming() {
         exercise_streaming(&conn, "SELECT * FROM analytics.events WHERE id <= 250000", 250_000),
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explain_plans() {
+    let Some(conn) = connect_or_skip(&pg_config(), &password()).await else {
+        return;
+    };
+    exercise_explain(&conn, JOIN, "UPDATE orders SET total = 0", "SELECT count(*), sum(total) FROM orders").await;
+    exercise_explain_one_statement(&conn, "SET application_name = 'tableplus_second'", "SHOW application_name").await;
+    exercise_read_only_explain(
+        &conn,
+        "SELECT pg_sleep(0.5)",
+        "UPDATE orders SET note = note WHERE id = 1",
+        "SET default_transaction_read_only = on",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explain_analyze_refuses_an_open_transaction() {
+    let Some(conn) = connect_or_skip(&pg_config(), &password()).await else {
+        return;
+    };
+    exercise_explain_in_transaction(&conn, "BEGIN", "UPDATE orders SET note = note WHERE id = 1").await;
+    conn.query("BEGIN", None).await.unwrap();
+    assert!(conn.query("SELECT 1 / 0", None).await.is_err());
+    let req = plan::request(&conn.server_info(), "SELECT 1", ExplainMode::Analyze).unwrap();
+    let err = conn.explain(&req).await.unwrap_err().to_string();
+    assert!(err.contains("transaction open"), "an aborted transaction is still open: {err}");
+    conn.query("ROLLBACK", None).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explain_analyze_blocks_writes_through_functions() {
+    let Some(conn) = connect_or_skip(&pg_config(), &password()).await else {
+        return;
+    };
+    let last_value = "SELECT last_value, is_called FROM categories_id_seq";
+    let before = rows(&conn, last_value).await.rows;
+    let req = plan::request(&conn.server_info(), "SELECT nextval('categories_id_seq')", ExplainMode::Analyze).unwrap();
+    let err = conn.explain(&req).await.unwrap_err().to_string();
+    assert!(err.contains("read-only transaction"), "{err}");
+    assert_eq!(rows(&conn, last_value).await.rows, before, "the sequence did not move");
+    conn.query("UPDATE orders SET note = note WHERE id = 1", None).await.unwrap();
 }

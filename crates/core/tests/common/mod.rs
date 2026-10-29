@@ -12,6 +12,7 @@ use tableplus_core::alter::{ColumnDef, StructureChange, alter_statements, create
 use tableplus_core::config::{ConnectionConfig, Credentials, DriverKind};
 use tableplus_core::driver::{self, DynConnection};
 use tableplus_core::export::{CsvImportOptions, ExportFormat, ExportOptions, csv_to_inserts, export_to_vec};
+use tableplus_core::plan::{self, Explain, ExplainMode, Plan};
 use tableplus_core::sqlgen::{self, CellEdit, Filter, FilterOp, RowIdentity, SortKey};
 use tableplus_core::{Dialect, StatementResult, Value};
 
@@ -426,6 +427,88 @@ pub async fn exercise_streaming(conn: &DynConnection, sql: &str, expected: u64) 
     let err = conn.query_batches(sql, 10, &mut |_, _| anyhow::bail!("stop")).await.unwrap_err();
     assert_eq!(err.to_string(), "stop");
     assert!(conn.query("SELECT 1", None).await.is_ok());
+}
+
+/// Explains `sql` as the query tab does and parses the plan.
+pub async fn explain(conn: &DynConnection, sql: &str, mode: ExplainMode) -> Plan {
+    let req = plan::request(&conn.server_info(), sql, mode).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let explained = conn.explain(&req).await.unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+    assert_eq!(explained.reset_error, None, "{sql}");
+    let rs = explained.output.rows().unwrap_or_else(|| panic!("{sql}: the plan has rows"));
+    let plan = plan::parse(&conn.server_info(), rs).expect("a plan").unwrap_or_else(|e| panic!("{sql}: {e}"));
+    assert_eq!(plan.format, req.format, "{sql}");
+    plan
+}
+
+/// Explain and Explain Analyze of a `query` that joins tables. `write` would change the rows that
+/// `checksum` sums, so Explain Analyze refuses it and only its estimate runs.
+pub async fn exercise_explain(conn: &DynConnection, query: &str, write: &str, checksum: &str) {
+    let estimate = explain(conn, query, ExplainMode::Estimate).await;
+    assert!(!estimate.analyzed() && estimate.node_count() > 2, "{estimate:#?}");
+    let analyzed = explain(conn, query, ExplainMode::Analyze).await;
+    assert!(analyzed.analyzed() && analyzed.total_ms().is_some(), "{analyzed:#?}");
+    assert!(analyzed.node_count() > 2);
+
+    let before = rows(conn, checksum).await.rows;
+    let refused = plan::request(&conn.server_info(), write, ExplainMode::Analyze).unwrap_err();
+    assert!(refused.0.contains("UPDATE"), "{refused}");
+    assert!(!explain(conn, write, ExplainMode::Estimate).await.analyzed());
+    assert_eq!(rows(conn, checksum).await.rows, before, "the write never ran");
+
+    let mut req = plan::request(&conn.server_info(), query, ExplainMode::Estimate).unwrap();
+    req.reset.push("SELECT * FROM tableplus_no_such_table".into());
+    let explained = conn.explain(&req).await.unwrap();
+    let reset = explained.reset_error.expect("the failed reset is reported");
+    assert!(reset.contains("tableplus_no_such_table"), "{reset}");
+    req.explain =
+        plan::request(&conn.server_info(), "SELECT * FROM tableplus_missing", ExplainMode::Estimate).unwrap().explain;
+    let err = format!("{:#}", conn.explain(&req).await.unwrap_err());
+    assert!(err.contains("tableplus_missing") && err.contains("tableplus_no_such_table"), "{err}");
+}
+
+/// The server refuses a plan request whose text holds a second statement, even one the statement
+/// check never saw. `second` changes session state that `probe` reads.
+pub async fn exercise_explain_one_statement(conn: &DynConnection, second: &str, probe: &str) {
+    let before = rows(conn, probe).await.rows;
+    let mut req = plan::request(&conn.server_info(), "SELECT 1", ExplainMode::Estimate).unwrap();
+    req.explain = Explain::Statement(format!("{}; {second}", req.explain.sql()));
+    assert!(conn.explain(&req).await.is_err(), "the server refuses a second statement");
+    assert_eq!(rows(conn, probe).await.rows, before, "the second statement never ran");
+}
+
+/// Explain Analyze runs in a read-only session and leaves the session as it found it, before any
+/// other statement on the connection runs. `slow` takes half a second, `touch` changes no data
+/// but needs a writable session, and `set_read_only` makes the session read-only.
+pub async fn exercise_read_only_explain(conn: &DynConnection, slow: &str, touch: &str, set_read_only: &str) {
+    let started = Instant::now();
+    let task = {
+        let conn = conn.clone();
+        let slow = slow.to_string();
+        tokio::spawn(async move { explain(&conn, &slow, ExplainMode::Analyze).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    conn.query(touch, None).await.unwrap_or_else(|e| panic!("{touch} runs after the reset: {e:#}"));
+    assert!(started.elapsed().as_millis() >= 450, "{touch} waited for the Explain Analyze");
+    task.await.unwrap();
+    conn.query(touch, None).await.unwrap();
+
+    conn.query(set_read_only, None).await.unwrap();
+    explain(conn, "SELECT 1", ExplainMode::Analyze).await;
+    let err = conn.query(touch, None).await.unwrap_err().to_string();
+    assert!(err.to_ascii_lowercase().replace('-', " ").contains("read only"), "{err}");
+}
+
+/// Explain Analyze refuses a session that has its own transaction open, because its read-only
+/// transaction can't start inside the user's, and leaves the user's transaction alone. `begin`
+/// opens a transaction and `touch` needs a writable one.
+pub async fn exercise_explain_in_transaction(conn: &DynConnection, begin: &str, touch: &str) {
+    conn.query(begin, None).await.unwrap();
+    let req = plan::request(&conn.server_info(), "SELECT 1", ExplainMode::Analyze).unwrap();
+    let err = conn.explain(&req).await.unwrap_err().to_string();
+    assert!(err.contains("transaction open"), "{err}");
+    conn.query(touch, None).await.unwrap_or_else(|e| panic!("the user's transaction stays writable: {e:#}"));
+    conn.query("ROLLBACK", None).await.unwrap();
+    explain(conn, "SELECT 1", ExplainMode::Analyze).await;
 }
 
 /// Times a closure for perf assertions/logging.

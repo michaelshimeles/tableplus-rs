@@ -52,13 +52,18 @@ struct Popup {
     anchor: Pos2,
 }
 
+/// Completion that runs again once a table it needs has loaded its columns.
+struct Retry {
+    cursor: usize,
+    tables: Vec<(String, String)>,
+}
+
 #[derive(Default)]
 pub struct CodeEditor {
     popup: Option<Popup>,
     pending_cursor: Option<usize>,
     last_text_len: usize,
-    /// Cursor position where completion waits for table columns to load.
-    retry_at: Option<usize>,
+    retry: Option<Retry>,
 }
 
 pub struct EditorOutput {
@@ -87,6 +92,7 @@ impl CodeEditor {
 
     pub fn close_popup(&mut self) {
         self.popup = None;
+        self.retry = None;
     }
 
     pub fn show(
@@ -132,7 +138,7 @@ impl CodeEditor {
                 }
             });
             if close {
-                self.popup = None;
+                self.close_popup();
             }
         }
         if let Some(s) = accept
@@ -218,24 +224,24 @@ impl CodeEditor {
                     let typed_ident = changed
                         && text.len() > self.last_text_len
                         && text[..primary].chars().last().is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.');
-                    let retry = !changed && self.retry_at == Some(primary);
-                    if changed || self.retry_at != Some(primary) {
-                        self.retry_at = None;
-                    }
+                    let retry = match self.retry.take() {
+                        Some(r) if !changed && r.cursor == primary => {
+                            let loaded = r.tables.iter().any(|(s, t)| catalog.columns(s, t).is_some());
+                            if !loaded {
+                                self.retry = Some(r);
+                            }
+                            loaded
+                        }
+                        _ => false,
+                    };
                     if (typed_ident || force_complete || retry || (self.popup.is_some() && changed))
                         && output.response.has_focus()
                     {
                         let res = complete(text, primary, dialect, catalog);
-                        if !res.missing_columns.is_empty()
-                            && res
-                                .suggestions
-                                .iter()
-                                .all(|s| s.kind != tableplus_core::completion::SuggestionKind::Column)
-                        {
-                            // Columns are loading; try again when they arrive.
-                            self.retry_at = Some(primary);
-                        }
                         missing = res.missing_columns;
+                        if !missing.is_empty() {
+                            self.retry = Some(Retry { cursor: primary, tables: missing.clone() });
+                        }
                         // A lone suggestion identical to the typed word adds nothing.
                         let only_exact = matches!(res.suggestions.as_slice(), [s] if s.label.eq_ignore_ascii_case(&res.context.prefix));
                         let show = !res.suggestions.is_empty()
@@ -359,5 +365,143 @@ impl CodeEditor {
             out.changed = true;
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use tableplus_core::model::{ColumnInfo, ObjectKind, SchemaObject};
+
+    use super::*;
+
+    /// A catalog whose table columns load one table at a time.
+    struct Cat {
+        objects: Vec<SchemaObject>,
+        columns: HashMap<String, Vec<ColumnInfo>>,
+    }
+
+    impl Cat {
+        fn new(tables: &[&str]) -> Self {
+            let objects = tables.iter().map(|t| SchemaObject::new("public", *t, ObjectKind::Table)).collect();
+            Self { objects, columns: HashMap::new() }
+        }
+
+        fn load(&mut self, table: &str, column: &str) {
+            let col = ColumnInfo { name: column.into(), data_type: "text".into(), ..Default::default() };
+            self.columns.insert(table.into(), vec![col]);
+        }
+    }
+
+    impl Catalog for Cat {
+        fn objects(&self) -> &[SchemaObject] {
+            &self.objects
+        }
+        fn columns(&self, _schema: &str, table: &str) -> Option<&[ColumnInfo]> {
+            self.columns.get(table).map(Vec::as_slice)
+        }
+        fn default_schema(&self) -> &str {
+            "public"
+        }
+    }
+
+    /// Runs the editor headless, one egui frame per call, with the cursor at the end of `sql`.
+    struct Harness {
+        ctx: egui::Context,
+        editor: CodeEditor,
+        sql: String,
+    }
+
+    impl Harness {
+        fn new(sql: &str, cat: &Cat) -> Self {
+            let mut editor = CodeEditor::default();
+            editor.set_cursor(sql.len());
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            let mut h = Self { ctx, editor, sql: sql.into() };
+            h.frame(cat);
+            h
+        }
+
+        fn frame_with(&mut self, cat: &Cat, events: Vec<egui::Event>) -> EditorOutput {
+            let Self { ctx, editor, sql } = self;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = None;
+            ctx.run_ui(input, |ui| {
+                out = Some(editor.show(ui, Id::new("sql"), sql, Dialect::Postgres, cat, 13.0));
+            })
+            .drop_without_applying_deltas();
+            out.expect("editor ran")
+        }
+
+        fn frame(&mut self, cat: &Cat) -> EditorOutput {
+            self.frame_with(cat, Vec::new())
+        }
+
+        fn ctrl_space(&mut self, cat: &Cat) -> EditorOutput {
+            let key = egui::Event::Key {
+                key: Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::CTRL,
+            };
+            self.frame_with(cat, vec![key])
+        }
+
+        /// Column suggestions in the open popup, sorted by name.
+        fn popup_columns(&self) -> Vec<String> {
+            let items = self.editor.popup.as_ref().map_or(&[][..], |p| p.items.as_slice());
+            let mut cols: Vec<String> =
+                items.iter().filter(|s| s.kind == SuggestionKind::Column).map(|s| s.label.clone()).collect();
+            cols.sort();
+            cols
+        }
+    }
+
+    #[test]
+    fn columns_from_each_joined_table_appear_as_they_load() {
+        let mut cat = Cat::new(&["alpha", "beta"]);
+        let mut h = Harness::new("select * from alpha a join beta b on true where name", &cat);
+        h.ctrl_space(&cat);
+
+        cat.load("alpha", "name_alpha");
+        h.frame(&cat);
+        assert_eq!(h.popup_columns(), ["name_alpha"]);
+
+        cat.load("beta", "name_beta");
+        h.frame(&cat);
+        assert_eq!(h.popup_columns(), ["name_alpha", "name_beta"]);
+    }
+
+    #[test]
+    fn closed_popup_stays_closed_after_columns_load() {
+        let mut cat = Cat::new(&["orders"]);
+        let mut h = Harness::new("select * from orders o where o.", &cat);
+        h.ctrl_space(&cat);
+        cat.load("orders", "id");
+        h.frame(&cat);
+        assert_eq!(h.popup_columns(), ["id"]);
+
+        h.editor.close_popup();
+        for _ in 0..3 {
+            h.frame(&cat);
+        }
+        assert!(h.editor.popup.is_none());
+    }
+
+    #[test]
+    fn table_that_never_loads_is_requested_once() {
+        let cat = Cat::new(&["orders"]);
+        let mut h = Harness::new("select * from orders o where o.", &cat);
+        assert_eq!(h.ctrl_space(&cat).missing_columns, [("public".to_string(), "orders".to_string())]);
+        for _ in 0..3 {
+            assert!(h.frame(&cat).missing_columns.is_empty());
+        }
     }
 }

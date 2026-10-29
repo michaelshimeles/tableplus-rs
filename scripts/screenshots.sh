@@ -46,6 +46,17 @@ WID=
 click() { xdotool mousemove $((OX + $1)) $((OY + $2)) click 1; sleep "${3:-0.4}"; }
 dclick() { xdotool mousemove $((OX + $1)) $((OY + $2)) click --repeat 2 --delay 70 1; sleep "${3:-0.6}"; }
 hover() { xdotool mousemove $((OX + $1)) $((OY + $2)); sleep "${3:-0.4}"; }
+# Drags in ten steps; egui misses a press and release at different points with no motion between.
+drag() {
+  local i
+  xdotool mousemove $((OX + $1)) $((OY + $2)) mousedown 1
+  for i in $(seq 1 10); do
+    xdotool mousemove $((OX + $1 + ($3 - $1) * i / 10)) $((OY + $2 + ($4 - $2) * i / 10))
+    sleep 0.02
+  done
+  xdotool mouseup 1
+  sleep "${5:-0.6}"
+}
 key() { xdotool key "$@"; sleep 0.35; }
 typ() { xdotool type --delay 25 -- "$1"; sleep 0.3; }
 park() { xdotool mousemove $((OX + 640)) $((OY + 20)); }
@@ -248,6 +259,59 @@ scene_structure() {
   shot structure-preview
 }
 
+# Explain Analyze of a union of two grouped joins on MySQL, as the tree, the graph and the flame chart.
+scene_explain() {
+  launch Dark
+  connect $ROW_MYSQL
+  key ctrl+t
+  sleep 0.8
+  typlines "-- Top customers and categories by delivered revenue
+SELECT 'customer' AS kind, u.full_name AS name, COUNT(DISTINCT o.id) AS orders,
+  SUM(t.order_total) AS revenue,
+  (SELECT MAX(o2.placed_at) FROM orders o2 WHERE o2.user_id = u.id) AS last_order
+FROM users u
+JOIN orders o ON o.user_id = u.id
+JOIN (SELECT order_id, SUM(unit_price * quantity) AS order_total
+  FROM order_items GROUP BY order_id) t ON t.order_id = o.id
+WHERE o.status = 'delivered'
+  AND EXISTS (SELECT 1 FROM order_items oi2
+  JOIN products p2 ON p2.id = oi2.product_id
+  JOIN categories c2 ON c2.id = p2.category_id
+  WHERE oi2.order_id = o.id AND c2.name = 'Books')
+GROUP BY u.id, u.full_name
+HAVING COUNT(DISTINCT o.id) >= 2
+UNION ALL
+SELECT 'category', c.name, COUNT(DISTINCT oi.order_id),
+  SUM(oi.unit_price * oi.quantity), MAX(o.placed_at)
+FROM categories c
+JOIN products p ON p.category_id = c.id
+JOIN order_items oi ON oi.product_id = p.id
+JOIN orders o ON o.id = oi.order_id
+WHERE o.status = 'delivered' AND c.name <> 'Books'
+  AND NOT EXISTS (SELECT 1 FROM products p3 WHERE p3.category_id = c.id AND p3.stock = 0)
+GROUP BY c.id, c.name
+ORDER BY revenue DESC, name
+LIMIT 20;"
+  key Escape
+  click 700 150 0.3
+  key ctrl+Home
+  drag 800 424 800 300 # editor and plan splitter
+  key ctrl+shift+e
+  sleep 3
+  park
+  shot explain-tree
+  click 337 348 1      # Graph
+  drag 800 300 800 150 # give the graph more height
+  dclick 504 612 1.5   # fold the customer branch under Filter
+  click 998 834 0.8    # zoom in one step
+  park
+  shot explain-graph
+  click 394 236 1      # Flame
+  click 400 526 0.8    # the index lookup into the derived table, with its details
+  park
+  shot explain-flame
+}
+
 # Light theme: an SSH-tunnelled connection being tested, then two sessions side by side.
 scene_light() {
   launch Light
@@ -298,7 +362,7 @@ scene_light() {
   shot light-mysql
 }
 
-SCENES=(welcome editing large sql structure light)
+SCENES=(welcome editing large sql structure explain light)
 if [[ $# -gt 0 ]]; then SCENES=("$@"); fi
 for s in "${SCENES[@]}"; do
   echo "scene: $s"

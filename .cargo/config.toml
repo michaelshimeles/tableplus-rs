@@ -1,0 +1,4 @@
+[env]
+# The bundled SQLite counts loops, rows and CPU cycles per plan step, which Explain Analyze reads
+# through sqlite3_stmt_scanstatus_v2. See "Explain Analyze on SQLite" in DECISIONS.md.
+LIBSQLITE3_FLAGS = "SQLITE_ENABLE_STMT_SCANSTATUS"

@@ -41,6 +41,7 @@ runs on Linux, which is where the screenshots below were taken (Xvfb, software r
 - Syntax highlighting for each dialect, line numbers
 - Autocomplete for keywords, functions, schemas, tables and columns — alias-aware (`u.` lists the columns of `users u`), and quiet inside comments and strings
 - Run the statement under the cursor or the selection (`⌘↩`), or everything (`⌘⇧↩`); one result tab per statement plus a Messages tab with timings, affected rows and errors pointing at the failing statement
+- Explain (`⌘E`) shows the planner's estimates without running the statement; Explain Analyze (`⌘⇧E`) runs it and measures each step, for MySQL, MariaDB, PostgreSQL and SQLite. Plans open as a collapsible tree with estimated and actual rows, loops and time bars, a Workbench-style graph coloured by how each table is read, and a flame chart; a detail panel lists every value the server reported. A hand-typed `EXPLAIN` gets the same view. Explain Analyze shows the estimated plan instead of running a statement that writes (`INSERT`, `UPDATE`, `DELETE`, a data-changing CTE, `SELECT … INTO`), and runs the rest read-only, so a query that writes through a function such as `nextval` fails instead of changing data. With a transaction already open, Explain Analyze asks you to commit or roll back first.
 - Query history per connection, searchable, reopenable
 - Results are capped (100,000 rows by default) and can be cancelled
 
@@ -60,7 +61,8 @@ runs on Linux, which is where the screenshots below were taken (Xvfb, software r
 | ![Two million rows](docs/screenshots/large-table.png) Filtering and sorting a 2,000,000-row table | ![Autocomplete](docs/screenshots/sql-autocomplete.png) Alias-aware column completion |
 | ![Results](docs/screenshots/sql-results.png) Run all: one result tab per statement | ![Quick open](docs/screenshots/quick-open.png) `⌘K` quick open |
 | ![Structure](docs/screenshots/structure-preview.png) Structure edits become reviewed `ALTER` statements | ![Connection dialog](docs/screenshots/connection-dialog.png) SSH tunnel + successful Test (light theme) |
-| ![MySQL, light](docs/screenshots/light-mysql.png) MySQL session next to a PostgreSQL one | |
+| ![MySQL, light](docs/screenshots/light-mysql.png) MySQL session next to a PostgreSQL one | ![Explain Analyze](docs/screenshots/explain-tree.png) `⌘⇧E` Explain Analyze on MySQL: estimated and actual rows per step, with a badge on a 72,306× miss |
+| ![Plan graph](docs/screenshots/explain-graph.png) The same plan as a graph, with a branch folded by double-clicking its step | ![Flame chart](docs/screenshots/explain-flame.png) Flame chart: width is time, and the details say how far the estimate missed |
 
 All screenshots are produced by [`scripts/screenshots.sh`](scripts/screenshots.sh), which drives the
 release build against the dockerized databases with `xdotool`.
@@ -73,6 +75,13 @@ Requires Rust 1.85+ (edition 2024).
 cargo build --release          # binary: target/release/tableplus-rs
 cargo run --release
 ```
+
+`.cargo/config.toml` sets `LIBSQLITE3_FLAGS=SQLITE_ENABLE_STMT_SCANSTATUS` for every cargo command
+run inside the repository, and the build needs it: the app links `sqlite3_stmt_scanstatus_v2`,
+which the bundled SQLite only has with that flag. Cargo reads that file from the working
+directory, so a build started outside the repository (`cargo install --git`, or `--manifest-path`
+from elsewhere) fails to link, as does one with `LIBSQLITE3_FLAGS` already set in the environment
+without the flag.
 
 **macOS** — build a signed `.app` and a DMG in `dist/` (ad-hoc signature unless `SIGN_IDENTITY` is set):
 
@@ -129,6 +138,9 @@ TABLEPLUS_RS_HOME=/tmp/tp-demo cargo run --release
 | `⌘⇧]` / `⌘⇧[`, `Ctrl+Tab` | Next / previous tab |
 | `⌘↩` | Run current statement (or selection) |
 | `⌘⇧↩` | Run all statements |
+| `⌘E` | Explain the current statement (estimated plan) |
+| `⌘⇧E` | Explain Analyze (runs the statement and measures its plan) |
+| `←` / `→`, `↑` / `↓`, `Space` | In a plan: collapse / expand, move, toggle |
 | `⌘S` | Commit staged changes |
 | `⌘R` | Reload |
 | `⌘F` | Filter rows |
@@ -150,8 +162,10 @@ The integration tests (`crates/core/tests/`) run against the real servers: intro
 schemas/tables/views/routines/indexes/constraints, every column type round-tripping through the
 grid's text representation, staged edits committed and rolled back, `ALTER` generation applied to
 real tables, CSV import, streaming 250,000 rows, query cancellation, TLS, and connecting through the
-SSH bastion. CI (`.github/workflows/ci.yml`) runs rustfmt, clippy with `-D warnings` and the full
-suite against the docker databases on Linux, and builds, unit-tests and bundles the app on macOS.
+SSH bastion, plus Explain and Explain Analyze on each engine. `plan_fixtures.rs` parses plans from
+the server versions the stack doesn't run, kept in `crates/core/tests/fixtures/explain/`. CI
+(`.github/workflows/ci.yml`) runs rustfmt, clippy with `-D warnings` and the full suite against the
+docker databases on Linux, and builds, unit-tests and bundles the app on macOS.
 
 ## Performance
 
@@ -178,6 +192,9 @@ crates/core   tableplus-core — no UI code
   sqlgen.rs     SELECT/COUNT with filters, sorting and paging; UPDATE/INSERT/DELETE for staged edits
   alter.rs      structure diff → ALTER TABLE / CREATE INDEX / COMMENT per dialect
   sqltext.rs    lexer shared by highlighting, statement splitting and completion
+  plan/         query plans: one tree model for every engine, the EXPLAIN statement per engine
+                and version, and parsers for MySQL TREE and JSON, MariaDB and PostgreSQL JSON,
+                and SQLite's query plan and measured scan status
   completion.rs context-aware autocomplete (tables, aliases, columns, keywords, functions)
   export.rs     CSV / JSON / INSERT writers, CSV → INSERT import
   config.rs, store.rs, secrets.rs   saved connections, history, Keychain / 0600 secrets file
@@ -186,6 +203,8 @@ crates/app    the egui application (binary: tableplus-rs)
   grid.rs       virtualized data grid;  staged.rs  staged edits
   table_tab.rs  data + structure tabs;  structure.rs  structure editor
   query_tab.rs  SQL editor + result tabs;  editor.rs  code editor with highlighting and completion
+  plan_view.rs  plan pane: tree with time bars, graph (plan_graph.rs), flame chart (plan_flame.rs)
+                and a detail panel
   sidebar.rs, quick_open.rs, welcome.rs, conn_dialog.rs, export_dialog.rs, theme.rs, …
 ```
 

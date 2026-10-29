@@ -1,21 +1,26 @@
 //! SQLite via `rusqlite`; blocking calls run on tokio's blocking pool.
 
+use std::ffi::{CStr, c_char, c_int};
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use rusqlite::config::DbConfig;
 use rusqlite::types::ValueRef;
-use rusqlite::{InterruptHandle, OpenFlags};
+use rusqlite::{InterruptHandle, OpenFlags, ffi};
 
-use super::{BatchSink, Connection};
+use super::{BatchSink, Connection, Explained, explained};
 use crate::alter::{ColumnDef, create_table_sql};
 use crate::config::ConnectionConfig;
 use crate::dialect::Dialect;
 use crate::model::{
-    ColumnInfo, ColumnMeta, ConstraintInfo, ConstraintKind, IndexInfo, ObjectKind, ResultSet, Row, SchemaObject,
-    StatementResult, TableStructure,
+    ColumnInfo, ColumnMeta, ConstraintInfo, ConstraintKind, IndexInfo, ObjectKind, QueryOutput, ResultSet, Row,
+    SchemaObject, StatementResult, TableStructure,
 };
+use crate::plan::{Explain, ExplainStatements, SQLITE_SCAN_STATUS_COLUMNS, SQLITE_STATEMENT_ID};
+use crate::server::{Flavor, ServerInfo};
 use crate::value::Value;
 
 const D: Dialect = Dialect::Sqlite;
@@ -25,6 +30,8 @@ pub struct SqliteConnection {
     interrupt: InterruptHandle,
     path: String,
     version: String,
+    /// The library can measure plan steps ([`measure`]).
+    scan_status: bool,
 }
 
 fn value_from(v: ValueRef<'_>) -> Value {
@@ -50,6 +57,29 @@ fn meta_rows(conn: &rusqlite::Connection, sql: &str) -> rusqlite::Result<Cells> 
     Ok(out)
 }
 
+fn query_on(c: &rusqlite::Connection, sql: &str, max_rows: Option<usize>) -> Result<StatementResult> {
+    let mut stmt = c.prepare(sql)?;
+    if stmt.column_count() == 0 {
+        let n = stmt.execute([])?;
+        return Ok(StatementResult::Affected(n as u64));
+    }
+    let columns: Vec<ColumnMeta> =
+        stmt.columns().iter().map(|c| ColumnMeta::new(c.name(), c.decl_type().unwrap_or_default())).collect();
+    let n = columns.len();
+    let limit = max_rows.unwrap_or(usize::MAX);
+    let mut rows: Vec<Row> = Vec::new();
+    let mut truncated = false;
+    let mut q = stmt.query([])?;
+    while let Some(r) = q.next()? {
+        if rows.len() >= limit {
+            truncated = true;
+            break;
+        }
+        rows.push((0..n).map(|i| value_from(r.get_ref(i).unwrap_or(ValueRef::Null))).collect());
+    }
+    Ok(StatementResult::Rows(ResultSet { columns, rows, truncated }))
+}
+
 fn s(v: &Option<String>) -> String {
     v.clone().unwrap_or_default()
 }
@@ -69,6 +99,7 @@ impl SqliteConnection {
             let version: String = conn.query_row("SELECT sqlite_version()", [], |r| r.get(0))?;
             Ok(Self {
                 interrupt: conn.get_interrupt_handle(),
+                scan_status: scan_status_available(&conn),
                 conn: Arc::new(Mutex::new(conn)),
                 path: display,
                 version,
@@ -102,6 +133,10 @@ impl Connection for SqliteConnection {
 
     fn server_version(&self) -> String {
         format!("SQLite {}", self.version)
+    }
+
+    fn server_info(&self) -> ServerInfo {
+        ServerInfo::from_version_text(Flavor::Sqlite, &self.version).with_scan_status(self.scan_status)
     }
 
     fn database(&self) -> String {
@@ -313,29 +348,7 @@ impl Connection for SqliteConnection {
 
     async fn query(&self, sql: &str, max_rows: Option<usize>) -> Result<StatementResult> {
         let sql = sql.to_string();
-        self.with_conn(move |c| {
-            let mut stmt = c.prepare(&sql)?;
-            if stmt.column_count() == 0 {
-                let n = stmt.execute([])?;
-                return Ok(StatementResult::Affected(n as u64));
-            }
-            let columns: Vec<ColumnMeta> =
-                stmt.columns().iter().map(|c| ColumnMeta::new(c.name(), c.decl_type().unwrap_or_default())).collect();
-            let n = columns.len();
-            let limit = max_rows.unwrap_or(usize::MAX);
-            let mut rows: Vec<Row> = Vec::new();
-            let mut truncated = false;
-            let mut q = stmt.query([])?;
-            while let Some(r) = q.next()? {
-                if rows.len() >= limit {
-                    truncated = true;
-                    break;
-                }
-                rows.push((0..n).map(|i| value_from(r.get_ref(i).unwrap_or(ValueRef::Null))).collect());
-            }
-            Ok(StatementResult::Rows(ResultSet { columns, rows, truncated }))
-        })
-        .await
+        self.with_conn(move |c| query_on(c, &sql, max_rows)).await
     }
 
     async fn query_batches(&self, sql: &str, batch: usize, sink: &mut BatchSink<'_>) -> Result<u64> {
@@ -395,6 +408,31 @@ impl Connection for SqliteConnection {
         .await
     }
 
+    async fn explain(&self, req: &ExplainStatements) -> Result<Explained> {
+        let req = req.clone();
+        let scan_status = self.scan_status;
+        self.with_conn(move |c| {
+            let plan = (|| {
+                for setup in &req.setup {
+                    query_on(c, setup, None)?;
+                }
+                let started = Instant::now();
+                let result = match &req.explain {
+                    Explain::Statement(sql) => query_on(c, sql, None)?,
+                    Explain::Measure(_) if !scan_status => bail!(
+                        "This SQLite library was built without SQLITE_ENABLE_STMT_SCANSTATUS, so it can't measure statements."
+                    ),
+                    Explain::Measure(sql) => StatementResult::Rows(measure(c, sql)?),
+                };
+                Ok(QueryOutput { sql: req.explain.sql().to_string(), result, elapsed: started.elapsed() })
+            })();
+            let failed =
+                req.reset.iter().filter_map(|r| query_on(c, r, None).err().map(|e| format!("{r}: {e:#}"))).collect();
+            explained(plan, failed)
+        })
+        .await
+    }
+
     async fn cancel(&self) -> Result<()> {
         self.interrupt.interrupt();
         Ok(())
@@ -403,6 +441,162 @@ impl Connection for SqliteConnection {
     async fn ping(&self) -> Result<()> {
         self.meta("SELECT 1".into()).await.map(|_| ())
     }
+}
+
+/// Whether the library can measure plan steps. Collection then stays off for ordinary
+/// statements, because SQLite counts cycles for every instruction while it is on; [`measure`]
+/// turns it on for its own statement.
+fn scan_status_available(conn: &rusqlite::Connection) -> bool {
+    let compiled = conn
+        .query_row("SELECT sqlite_compileoption_used('ENABLE_STMT_SCANSTATUS')", [], |r| r.get::<_, bool>(0))
+        .unwrap_or(false);
+    compiled && conn.set_db_config(DbConfig::SQLITE_DBCONFIG_STMT_SCANSTATUS, false).is_ok()
+}
+
+/// Runs `sql` to its last row with scan status on and returns what SQLite measured: a row for
+/// the statement, then one per plan step, in [`SQLITE_SCAN_STATUS_COLUMNS`].
+fn measure(conn: &rusqlite::Connection, sql: &str) -> Result<ResultSet> {
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_STMT_SCANSTATUS, true)?;
+    let measured = RawStatement::prepare(conn, sql).and_then(|mut stmt| {
+        if !stmt.readonly() {
+            bail!("Explain Analyze runs the statement, and this one would change data.");
+        }
+        let mut returned = 0i64;
+        let mut in_sqlite = Duration::ZERO;
+        loop {
+            let step = Instant::now();
+            let row = stmt.step()?;
+            in_sqlite += step.elapsed();
+            if !row {
+                break;
+            }
+            returned += 1;
+        }
+        Ok(stmt.scan_status(returned, in_sqlite))
+    });
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_STMT_SCANSTATUS, false)?;
+    measured
+}
+
+/// A statement prepared through SQLite's C API, because rusqlite keeps its statement handle
+/// private and `sqlite3_stmt_scanstatus_v2` needs it. Finalized on drop.
+struct RawStatement<'conn> {
+    db: *mut ffi::sqlite3,
+    stmt: *mut ffi::sqlite3_stmt,
+    _conn: PhantomData<&'conn rusqlite::Connection>,
+}
+
+impl<'conn> RawStatement<'conn> {
+    fn prepare(conn: &'conn rusqlite::Connection, sql: &str) -> Result<Self> {
+        let len = c_int::try_from(sql.len()).context("the statement is too long")?;
+        // SAFETY: the handle is valid while `conn` is borrowed, which `'conn` ties this
+        // statement to, and SQLite reads exactly `len` bytes of `sql`.
+        let (db, rc, stmt) = unsafe {
+            let db = conn.handle();
+            let mut stmt = std::ptr::null_mut();
+            let rc = ffi::sqlite3_prepare_v2(db, sql.as_ptr().cast(), len, &mut stmt, std::ptr::null_mut());
+            (db, rc, stmt)
+        };
+        if rc != ffi::SQLITE_OK {
+            bail!("{}", error_message(db));
+        }
+        if stmt.is_null() {
+            bail!("There is no statement to measure.");
+        }
+        Ok(Self { db, stmt, _conn: PhantomData })
+    }
+
+    fn readonly(&self) -> bool {
+        // SAFETY: `stmt` is a live prepared statement.
+        unsafe { ffi::sqlite3_stmt_readonly(self.stmt) != 0 }
+    }
+
+    /// Runs to the next row; `false` when the statement is done.
+    fn step(&mut self) -> Result<bool> {
+        // SAFETY: `stmt` is a live prepared statement.
+        match unsafe { ffi::sqlite3_step(self.stmt) } {
+            ffi::SQLITE_ROW => Ok(true),
+            ffi::SQLITE_DONE => Ok(false),
+            _ => bail!("{}", error_message(self.db)),
+        }
+    }
+
+    /// One scan status value of step `idx`, or of the whole statement for -1, written over
+    /// `out`. `None` past the last step.
+    ///
+    /// # Safety
+    ///
+    /// `T` must be the type SQLite writes for `op`.
+    unsafe fn status<T>(&self, idx: c_int, op: c_int, mut out: T) -> Option<T> {
+        let flags = ffi::SQLITE_SCANSTAT_COMPLEX;
+        let rc = unsafe { ffi::sqlite3_stmt_scanstatus_v2(self.stmt, idx, op, flags, (&mut out as *mut T).cast()) };
+        (rc == 0).then_some(out)
+    }
+
+    /// The statement's row, then every plan step's, in plan order. SQLite's -1 for a value it
+    /// doesn't have becomes NULL.
+    fn scan_status(&self, returned: i64, in_sqlite: Duration) -> ResultSet {
+        let count = |n: Option<i64>| match n {
+            Some(n) if n >= 0 => Value::Int(n),
+            _ => Value::Null,
+        };
+        let mut steps: Vec<(c_int, Row)> = Vec::new();
+        for idx in 0.. {
+            // SAFETY: each call passes the type SQLite writes for its op: an int for SELECTID and
+            // PARENTID, a string pointer for EXPLAIN, an sqlite3_int64 for NLOOP, NVISIT and
+            // NCYCLE, and a double for EST. EXPLAIN's text lives as long as `stmt`.
+            let row = unsafe {
+                let Some(id) = self.status(idx, ffi::SQLITE_SCANSTAT_SELECTID, -1 as c_int) else { break };
+                let detail = match self.status(idx, ffi::SQLITE_SCANSTAT_EXPLAIN, std::ptr::null::<c_char>()) {
+                    Some(text) if !text.is_null() => Value::Text(CStr::from_ptr(text).to_string_lossy().into()),
+                    _ => Value::Null,
+                };
+                let row = vec![
+                    Value::Int(id.into()),
+                    Value::Int(self.status(idx, ffi::SQLITE_SCANSTAT_PARENTID, -1 as c_int).unwrap_or(-1).into()),
+                    detail,
+                    count(self.status(idx, ffi::SQLITE_SCANSTAT_NLOOP, -1i64)),
+                    count(self.status(idx, ffi::SQLITE_SCANSTAT_NVISIT, -1i64)),
+                    self.status(idx, ffi::SQLITE_SCANSTAT_EST, 0.0f64).map_or(Value::Null, Value::Float),
+                    count(self.status(idx, ffi::SQLITE_SCANSTAT_NCYCLE, -1i64)),
+                    Value::Null,
+                ];
+                (id, row.into())
+            };
+            steps.push(row);
+        }
+        steps.sort_by_key(|(id, _)| *id);
+        // SAFETY: NCYCLE writes an sqlite3_int64.
+        let cycles = unsafe { self.status(-1, ffi::SQLITE_SCANSTAT_NCYCLE, -1i64) };
+        let statement: Row = vec![
+            Value::Int(SQLITE_STATEMENT_ID),
+            Value::Null,
+            Value::Null,
+            Value::Int(1),
+            Value::Int(returned),
+            Value::Null,
+            count(cycles),
+            Value::Float(in_sqlite.as_secs_f64() * 1000.0),
+        ]
+        .into();
+        ResultSet {
+            columns: SQLITE_SCAN_STATUS_COLUMNS.iter().map(|c| ColumnMeta::new(*c, "")).collect(),
+            rows: std::iter::once(statement).chain(steps.into_iter().map(|(_, row)| row)).collect(),
+            truncated: false,
+        }
+    }
+}
+
+impl Drop for RawStatement<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `stmt` was prepared by `prepare` and is finalized only here.
+        unsafe { ffi::sqlite3_finalize(self.stmt) };
+    }
+}
+
+fn error_message(db: *mut ffi::sqlite3) -> String {
+    // SAFETY: `db` is a live connection, and SQLite keeps the message until its next call.
+    unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(db)) }.to_string_lossy().into_owned()
 }
 
 /// Pulls `CHECK (…)` clauses out of a CREATE TABLE statement (balanced parentheses).

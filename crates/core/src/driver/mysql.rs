@@ -2,20 +2,23 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_trait::async_trait;
-use mysql_async::consts::{ColumnFlags, ColumnType};
+use futures_util::FutureExt;
+use mysql_async::consts::{ColumnFlags, ColumnType, StatusFlags};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Opts, OptsBuilder, SslOpts};
 use tokio::sync::Mutex;
 
-use super::{BatchSink, Connection};
+use super::{BatchSink, Connection, Explained, explain_with};
 use crate::config::{ConnectionConfig, Credentials, SslMode};
 use crate::dialect::Dialect;
 use crate::model::{
     ColumnInfo, ColumnMeta, ConstraintInfo, ConstraintKind, IndexInfo, ObjectKind, ResultSet, Row, SchemaObject,
     StatementResult, TableStructure,
 };
+use crate::plan::ExplainStatements;
+use crate::server::{Flavor, ServerInfo};
 use crate::tunnel::{SshTunnel, open_tunnel};
 use crate::value::Value;
 
@@ -172,6 +175,75 @@ fn s(v: &Option<String>) -> String {
     v.clone().unwrap_or_default()
 }
 
+/// Prepares `sql` on the server and drops it. The text goes in as a hex literal, so the server
+/// reads it in the session's character set and sql_mode; `mysql_async`'s own prepare fails under
+/// NO_BACKSLASH_ESCAPES.
+async fn prepare(conn: &mut Conn, sql: &str) -> Result<()> {
+    // A packet over max_allowed_packet closes the connection, and hex doubles the text, so it is
+    // checked first and staged in pieces.
+    let packet: u64 =
+        conn.query_first("SELECT @@max_allowed_packet").await.map_err(my_error)?.context("no max_allowed_packet")?;
+    let packet = usize::try_from(packet).unwrap_or(usize::MAX);
+    ensure!(
+        sql.len() + 2 <= packet,
+        "The plan request is {} bytes, more than the server's max_allowed_packet of {packet} bytes allows.",
+        sql.len()
+    );
+    let chunk = (packet.saturating_sub(128) / 2).clamp(1, 256 * 1024);
+    let prepared = stage_and_prepare(conn, sql.as_bytes(), chunk).await;
+    conn.query_drop("SET @tableplus_explain_sql = NULL").await.map_err(my_error)?;
+    prepared.map_err(my_error)?;
+    conn.query_drop("DEALLOCATE PREPARE tableplus_explain").await.map_err(my_error)
+}
+
+async fn stage_and_prepare(conn: &mut Conn, sql: &[u8], chunk: usize) -> mysql_async::Result<()> {
+    conn.query_drop("SET @tableplus_explain_sql = X''").await?;
+    for chunk in sql.chunks(chunk) {
+        let hex: String = chunk.iter().map(|b| format!("{b:02X}")).collect();
+        conn.query_drop(format!("SET @tableplus_explain_sql = CONCAT(@tableplus_explain_sql, X'{hex}')")).await?;
+    }
+    conn.query_drop("PREPARE tableplus_explain FROM @tableplus_explain_sql").await
+}
+
+/// The server flags an open transaction in every OK packet; `DO 0` fetches a fresh one.
+async fn in_transaction(conn: &mut Conn) -> Result<bool> {
+    conn.query_drop("DO 0").await.map_err(my_error)?;
+    let flags = conn.last_ok_packet().map(|ok| ok.status_flags()).context("the server sent no status")?;
+    Ok(flags.contains(StatusFlags::SERVER_STATUS_IN_TRANS))
+}
+
+async fn query_on(conn: &mut Conn, sql: &str, max_rows: Option<usize>) -> Result<StatementResult> {
+    let mut result = conn.query_iter(sql).await.map_err(my_error)?;
+    let columns = result.columns().filter(|c| !c.is_empty());
+    let Some(columns) = columns else {
+        let affected = result.affected_rows();
+        result.drop_result().await.map_err(my_error)?;
+        return Ok(StatementResult::Affected(affected));
+    };
+    let meta: Vec<ColumnMeta> = columns
+        .iter()
+        .map(|c| ColumnMeta::new(c.name_str(), type_label(c.column_type(), c.flags(), c.character_set())))
+        .collect();
+    let limit = max_rows.unwrap_or(usize::MAX);
+    let mut rows: Vec<Row> = Vec::new();
+    let mut truncated = false;
+    while let Some(row) = result.next().await.map_err(my_error)? {
+        if rows.len() >= limit {
+            truncated = true;
+            continue; // keep draining so the connection stays usable
+        }
+        let row: Row = row
+            .unwrap_raw()
+            .into_iter()
+            .zip(columns.iter())
+            .map(|(v, c)| to_value(v, c.column_type(), c.flags(), c.character_set()))
+            .collect();
+        rows.push(row);
+    }
+    result.drop_result().await.map_err(my_error)?;
+    Ok(StatementResult::Rows(ResultSet { columns: meta, rows, truncated }))
+}
+
 impl MyConnection {
     pub async fn connect(config: &ConnectionConfig, creds: &Credentials) -> Result<Self> {
         let tunnel = if config.ssh.enabled {
@@ -285,6 +357,10 @@ impl Connection for MyConnection {
     fn server_version(&self) -> String {
         let v = self.version.split('-').next().unwrap_or_default();
         if self.mariadb { format!("MariaDB {v}") } else { format!("MySQL {v}") }
+    }
+
+    fn server_info(&self) -> ServerInfo {
+        ServerInfo::from_version_text(if self.mariadb { Flavor::MariaDb } else { Flavor::MySql }, &self.version)
     }
 
     fn database(&self) -> String {
@@ -501,36 +577,7 @@ impl Connection for MyConnection {
     }
 
     async fn query(&self, sql: &str, max_rows: Option<usize>) -> Result<StatementResult> {
-        let mut conn = self.conn.lock().await;
-        let mut result = conn.query_iter(sql).await.map_err(my_error)?;
-        let columns = result.columns().filter(|c| !c.is_empty());
-        let Some(columns) = columns else {
-            let affected = result.affected_rows();
-            result.drop_result().await.map_err(my_error)?;
-            return Ok(StatementResult::Affected(affected));
-        };
-        let meta: Vec<ColumnMeta> = columns
-            .iter()
-            .map(|c| ColumnMeta::new(c.name_str(), type_label(c.column_type(), c.flags(), c.character_set())))
-            .collect();
-        let limit = max_rows.unwrap_or(usize::MAX);
-        let mut rows: Vec<Row> = Vec::new();
-        let mut truncated = false;
-        while let Some(row) = result.next().await.map_err(my_error)? {
-            if rows.len() >= limit {
-                truncated = true;
-                continue; // keep draining so the connection stays usable
-            }
-            let row: Row = row
-                .unwrap_raw()
-                .into_iter()
-                .zip(columns.iter())
-                .map(|(v, c)| to_value(v, c.column_type(), c.flags(), c.character_set()))
-                .collect();
-            rows.push(row);
-        }
-        result.drop_result().await.map_err(my_error)?;
-        Ok(StatementResult::Rows(ResultSet { columns: meta, rows, truncated }))
+        query_on(&mut *self.conn.lock().await, sql, max_rows).await
     }
 
     async fn query_batches(&self, sql: &str, batch: usize, sink: &mut BatchSink<'_>) -> Result<u64> {
@@ -595,6 +642,17 @@ impl Connection for MyConnection {
         }
         conn.query_drop("COMMIT").await.map_err(my_error)?;
         Ok(total)
+    }
+
+    async fn explain(&self, req: &ExplainStatements) -> Result<Explained> {
+        explain_with(
+            &mut *self.conn.lock().await,
+            req,
+            |conn, sql| query_on(conn, sql, None).boxed(),
+            |conn, sql| prepare(conn, sql).boxed(),
+            |conn| in_transaction(conn).boxed(),
+        )
+        .await
     }
 
     async fn cancel(&self) -> Result<()> {

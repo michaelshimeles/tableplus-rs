@@ -1,0 +1,62 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "table": {
+      "update": 1,
+      "table_name": "products",
+      "access_type": "index",
+      "key": "PRIMARY",
+      "key_length": "",
+      "used_key_parts": ["product_id"],
+      "rows": 77,
+      "attached_condition": "products.discontinued = 0 and <in_optimizer>(products.category_id,<exists>(subquery#2)) and exists(subquery#3)"
+    },
+    "subqueries": [
+      {
+        "query_block": {
+          "select_id": 3,
+          "table": {
+            "table_name": "od",
+            "access_type": "ref",
+            "possible_keys": ["PRIMARY", "idx_order_details_product_id"],
+            "key": "idx_order_details_product_id",
+            "key_length": "2",
+            "used_key_parts": ["product_id"],
+            "ref": ["northwind.products.product_id"],
+            "rows": 13,
+            "filtered": 100,
+            "using_index": true
+          },
+          "table": {
+            "table_name": "o",
+            "access_type": "eq_ref",
+            "possible_keys": ["PRIMARY"],
+            "key": "PRIMARY",
+            "key_length": "2",
+            "used_key_parts": ["order_id"],
+            "ref": ["northwind.od.order_id"],
+            "rows": 1,
+            "filtered": 100,
+            "attached_condition": "o.order_date >= '1998-01-01'"
+          }
+        }
+      },
+      {
+        "query_block": {
+          "select_id": 2,
+          "table": {
+            "table_name": "c",
+            "access_type": "unique_subquery",
+            "possible_keys": ["PRIMARY"],
+            "key": "PRIMARY",
+            "key_length": "2",
+            "used_key_parts": ["category_id"],
+            "ref": ["func"],
+            "rows": 1,
+            "filtered": 100
+          }
+        }
+      }
+    ]
+  }
+}

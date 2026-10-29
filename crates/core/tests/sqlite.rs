@@ -9,7 +9,11 @@ use tableplus_core::config::Credentials;
 use tableplus_core::driver;
 use tableplus_core::model::{ConstraintKind, ObjectKind};
 use tableplus_core::sqlgen::{self, SortKey};
-use tableplus_core::{StatementResult, Value};
+use tableplus_core::{Flavor, StatementResult, Value};
+
+/// Paid orders per country: a join, a grouping and a sort.
+const JOIN: &str = "SELECT u.country, count(*) FROM orders o JOIN users u ON u.id = o.user_id \
+                    WHERE o.status = 'paid' GROUP BY u.country ORDER BY 2 DESC";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_end_to_end() {
@@ -17,6 +21,7 @@ async fn sqlite_end_to_end() {
     let cfg = sqlite_fixture(dir.path()).await;
     let conn = driver::connect(&cfg, &Credentials::default()).await.unwrap();
     assert!(conn.server_version().starts_with("SQLite 3."));
+    assert_eq!((conn.server_info().flavor, conn.server_info().version.major), (Flavor::Sqlite, 3));
     assert_eq!(conn.database(), "shop.sqlite");
     assert_eq!(conn.list_schemas().await.unwrap(), vec!["main"]);
 
@@ -81,4 +86,13 @@ async fn sqlite_end_to_end() {
 
     timed("sqlite streaming 20k rows", exercise_streaming(&conn, "SELECT * FROM orders", 20_000)).await;
     exercise_editing(&conn, "main").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_explain_plans() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = sqlite_fixture(dir.path()).await;
+    let conn = driver::connect(&cfg, &Credentials::default()).await.unwrap();
+    exercise_explain(&conn, JOIN, "UPDATE orders SET total = 0", "SELECT count(*), total(total) FROM orders").await;
+    exercise_explain_one_statement(&conn, "PRAGMA user_version = 7", "PRAGMA user_version").await;
 }

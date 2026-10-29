@@ -1,5 +1,5 @@
-//! SQL editor tab: run the statement under the cursor / the selection / everything, with one
-//! result tab per statement and a messages log.
+//! SQL editor tab: run or explain the statement under the cursor / the selection / everything,
+//! with one result tab per statement (a grid, or a plan for EXPLAIN output) and a messages log.
 
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
@@ -8,30 +8,61 @@ use chrono::Utc;
 use eframe::egui::{self, Align, CornerRadius, Layout, RichText, Sense, Stroke, Ui, vec2};
 use tableplus_core::driver;
 use tableplus_core::model::{QueryOutput, StatementResult};
+use tableplus_core::plan::{self, ExplainMode, ExplainStatements};
 use tableplus_core::sqltext::{split_statements, statement_at};
 use tableplus_core::store::HistoryEntry;
-use tableplus_core::{Dialect, Value};
+use tableplus_core::{Dialect, ServerInfo, Value};
 
 use crate::app::{Action, shortcut_label};
 use crate::editor::CodeEditor;
 use crate::export_dialog::ExportSource;
 use crate::grid::{self, GridEvent, GridState, ResultData};
 use crate::icons::Icon;
+use crate::plan_view::{self, PlanContent, PlanView};
 use crate::task::{Task, poll_slot};
 use crate::theme::{self, palette};
 use crate::widgets::{self, fmt_count, fmt_duration};
 use crate::workspace::TabCtx;
 
+/// One statement to run, as the user wrote it.
+struct Job {
+    sql: String,
+    step: Result<Step, String>,
+    /// Shown with the result, such as why Explain Analyze fell back to estimates.
+    note: Option<String>,
+}
+
+enum Step {
+    Run,
+    Explain(ExplainStatements),
+}
+
 struct Outcome {
     sql: String,
     result: Result<QueryOutput, String>,
     elapsed: Duration,
+    /// Set when the result is a query plan.
+    plan: Option<PlanContent>,
+    note: Option<String>,
+    /// Why the session could not be put back after an EXPLAIN.
+    reset_error: Option<String>,
+}
+
+enum PaneBody {
+    Rows { grid: Box<GridState>, sort: Option<(usize, bool)> },
+    Plan(Box<PlanView>),
 }
 
 struct ResultPane {
     output: QueryOutput,
-    grid: GridState,
-    sort: Option<(usize, bool)>,
+    body: PaneBody,
+}
+
+/// Which result strip tab is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shown {
+    Pane(usize),
+    Messages,
 }
 
 pub struct QueryTab {
@@ -42,8 +73,7 @@ pub struct QueryTab {
     selection: Option<(usize, usize)>,
     panes: Vec<ResultPane>,
     messages: Vec<(bool, String)>,
-    active: usize,
-    show_messages: bool,
+    shown: Shown,
     running: Option<Task<Vec<Outcome>>>,
     started: Option<Instant>,
     total_elapsed: Option<Duration>,
@@ -61,44 +91,80 @@ impl QueryTab {
             selection: None,
             panes: Vec::new(),
             messages: Vec::new(),
-            active: 0,
-            show_messages: false,
+            shown: Shown::Messages,
             running: None,
             started: None,
             total_elapsed: None,
         }
     }
 
+    /// Each statement without leading whitespace, no-break spaces pasted from a web page included.
+    /// The end keeps them: there one belongs to the last name.
     fn statements_to_run(&self, dialect: Dialect, all: bool) -> Vec<String> {
-        if let Some((a, b)) = self.selection.filter(|_| !all) {
+        let (src, spans) = if let Some((a, b)) = self.selection.filter(|_| !all) {
             let sel = &self.sql[a.min(self.sql.len())..b.min(self.sql.len())];
-            return split_statements(sel, dialect).iter().map(|s| s.text(sel).to_string()).collect();
-        }
-        if all {
-            return split_statements(&self.sql, dialect).iter().map(|s| s.text(&self.sql).to_string()).collect();
-        }
-        statement_at(&self.sql, self.cursor, dialect).map(|s| vec![s.text(&self.sql).to_string()]).unwrap_or_default()
+            (sel, split_statements(sel, dialect))
+        } else if all {
+            (self.sql.as_str(), split_statements(&self.sql, dialect))
+        } else {
+            (self.sql.as_str(), statement_at(&self.sql, self.cursor, dialect).into_iter().collect())
+        };
+        spans.iter().map(|s| s.text(src).trim_start()).filter(|s| !s.is_empty()).map(str::to_string).collect()
     }
 
     fn run(&mut self, ctx: &mut TabCtx, all: bool) {
+        let jobs = self
+            .statements_to_run(ctx.dialect, all)
+            .into_iter()
+            .map(|sql| Job { sql, step: Ok(Step::Run), note: None })
+            .collect();
+        self.start(ctx, jobs);
+    }
+
+    /// Explains the statement under the cursor, or each selected statement.
+    fn explain(&mut self, ctx: &mut TabCtx, mode: ExplainMode) {
+        let server = ctx.conn.server_info();
+        let jobs =
+            self.statements_to_run(ctx.dialect, false).into_iter().map(|sql| explain_job(&server, sql, mode)).collect();
+        self.start(ctx, jobs);
+    }
+
+    fn start(&mut self, ctx: &mut TabCtx, jobs: Vec<Job>) {
         self.editor.close_popup();
-        if self.running.is_some() {
-            return;
-        }
-        let stmts = self.statements_to_run(ctx.dialect, all);
-        if stmts.is_empty() {
+        if self.running.is_some() || jobs.is_empty() {
             return;
         }
         let conn = ctx.conn.clone();
+        let server = conn.server_info();
         let limit = ctx.settings.row_limit();
         self.started = Some(Instant::now());
         self.running = Some(ctx.spawner.spawn(async move {
             let mut out = Vec::new();
-            for sql in stmts {
+            for job in jobs {
                 let start = Instant::now();
-                let result = driver::run(conn.as_ref(), &sql, limit).await.map_err(|e| format!("{e:#}"));
+                let mut reset_error = None;
+                let (result, plan) = match job.step {
+                    Err(reason) => (Err(reason), None),
+                    Ok(Step::Run) => {
+                        let result = driver::run(conn.as_ref(), &job.sql, limit).await.map_err(|e| format!("{e:#}"));
+                        let plan = match &result {
+                            Ok(out) => out.rows().and_then(|rs| PlanContent::detected(&server, &job.sql, rs)),
+                            Err(_) => None,
+                        };
+                        (result, plan)
+                    }
+                    Ok(Step::Explain(req)) => match conn.explain(&req).await {
+                        Ok(explained) => {
+                            reset_error = explained.reset_error;
+                            let plan =
+                                explained.output.rows().map(|rs| PlanContent::explained(&server, rs, req.format));
+                            (Ok(explained.output), plan)
+                        }
+                        Err(e) => (Err(format!("{e:#}")), None),
+                    },
+                };
                 let failed = result.is_err();
-                out.push(Outcome { sql, result, elapsed: start.elapsed() });
+                out.push(Outcome { sql: job.sql, result, elapsed: start.elapsed(), plan, note: job.note, reset_error });
                 if failed {
                     break;
                 }
@@ -112,7 +178,14 @@ impl QueryTab {
         self.total_elapsed = self.started.take().map(|s| s.elapsed());
         let outcomes = match result {
             Ok(o) => o,
-            Err(e) => vec![Outcome { sql: String::new(), result: Err(format!("{e:#}")), elapsed: Duration::ZERO }],
+            Err(e) => vec![Outcome {
+                sql: String::new(),
+                result: Err(format!("{e:#}")),
+                elapsed: Duration::ZERO,
+                plan: None,
+                note: None,
+                reset_error: None,
+            }],
         };
         self.panes.clear();
         self.messages.clear();
@@ -139,10 +212,25 @@ impl QueryTab {
                 }));
             }
             let short: String = o.sql.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect();
+            if let Some(note) = &o.note {
+                self.messages.push((false, format!("{note}\n→ {short}")));
+            }
+            if let Some(reset) = &o.reset_error {
+                self.messages.push((true, format!("{reset}\n→ {short}")));
+            }
             match o.result {
                 Ok(out) => {
-                    let msg = match &out.result {
-                        StatementResult::Rows(rs) => {
+                    let msg = match (&out.result, &o.plan) {
+                        (_, Some(PlanContent::Tree(plan))) => {
+                            let kind = if plan.analyzed() { "Analyzed plan" } else { "Estimated plan" };
+                            format!(
+                                "{kind}, {} · {} · {short}",
+                                widgets::plural(plan.node_count() as u64, "step"),
+                                fmt_duration(out.elapsed)
+                            )
+                        }
+                        (_, Some(PlanContent::Raw { .. })) => format!("Plan · {} · {short}", fmt_duration(out.elapsed)),
+                        (StatementResult::Rows(rs), None) => {
                             let more = if rs.truncated { " (truncated by row limit)" } else { "" };
                             format!(
                                 "{} returned{more} · {} · {short}",
@@ -150,20 +238,27 @@ impl QueryTab {
                                 fmt_duration(out.elapsed)
                             )
                         }
-                        StatementResult::Affected(n) => {
+                        (StatementResult::Affected(n), None) => {
                             format!("{} affected · {} · {short}", widgets::plural(*n, "row"), fmt_duration(out.elapsed))
                         }
                     };
                     self.messages.push((false, msg));
-                    if out.rows().is_some() {
-                        self.panes.push(ResultPane { output: out, grid: GridState::default(), sort: None });
+                    let body = match o.plan {
+                        Some(content) => Some(PaneBody::Plan(Box::new(PlanView::new(content, o.note)))),
+                        None => out.rows().map(|_| PaneBody::Rows { grid: Box::default(), sort: None }),
+                    };
+                    if let Some(body) = body {
+                        self.panes.push(ResultPane { output: out, body });
                     }
                 }
                 Err(e) => self.messages.push((true, format!("{e}\n→ {short}"))),
             }
         }
-        self.active = 0;
-        self.show_messages = self.panes.is_empty() || self.messages.iter().any(|(err, _)| *err);
+        self.shown = if self.panes.is_empty() || self.messages.iter().any(|(err, _)| *err) {
+            Shown::Messages
+        } else {
+            Shown::Pane(0)
+        };
         if ddl {
             ctx.actions.push(Action::RefreshObjects);
         }
@@ -176,6 +271,12 @@ impl QueryTab {
         }
         if sc.run_all {
             self.run(ctx, true);
+        }
+        if sc.explain {
+            self.explain(ctx, ExplainMode::Estimate);
+        }
+        if sc.explain_analyze {
+            self.explain(ctx, ExplainMode::Analyze);
         }
         let p = palette(ui);
 
@@ -204,6 +305,30 @@ impl QueryTab {
                         .clicked()
                     {
                         self.run(ctx, true);
+                    }
+                    if ui
+                        .add_enabled_ui(!running, |ui| widgets::icon_text_button(ui, Icon::Plan, "Explain"))
+                        .inner
+                        .on_hover_text(format!(
+                            "Show the planner's estimated plan, without running ({})",
+                            shortcut_label("E")
+                        ))
+                        .clicked()
+                    {
+                        self.explain(ctx, ExplainMode::Estimate);
+                    }
+                    if ui
+                        .add_enabled_ui(!running, |ui| {
+                            widgets::icon_text_button(ui, Icon::Stopwatch, "Explain Analyze")
+                        })
+                        .inner
+                        .on_hover_text(format!(
+                            "Run the statement and measure every step of its plan ({})",
+                            shortcut_label("⇧E")
+                        ))
+                        .clicked()
+                    {
+                        self.explain(ctx, ExplainMode::Analyze);
                     }
                     if running {
                         if widgets::icon_text_button(ui, Icon::Stop, "Stop").clicked() {
@@ -252,8 +377,33 @@ impl QueryTab {
         });
     }
 
+    /// Chip labels: `Result`/`Plan` alone, numbered when a kind repeats (`Result 2`, `Plan 2`).
+    fn chip_labels(&self) -> Vec<String> {
+        let is_plan = |p: &ResultPane| matches!(p.body, PaneBody::Plan(_));
+        let plans = self.panes.iter().filter(|p| is_plan(p)).count();
+        let grids = self.panes.len() - plans;
+        let (mut plan_n, mut grid_n) = (0, 0);
+        self.panes
+            .iter()
+            .map(|p| {
+                let (name, n, count) = if is_plan(p) {
+                    plan_n += 1;
+                    ("Plan", plan_n, plans)
+                } else {
+                    grid_n += 1;
+                    ("Result", grid_n, grids)
+                };
+                if count == 1 { name.to_string() } else { format!("{name} {n}") }
+            })
+            .collect()
+    }
+
     fn results(&mut self, ui: &mut Ui, ctx: &mut TabCtx) {
         let p = palette(ui);
+        let shown = match self.shown {
+            Shown::Pane(i) if i < self.panes.len() => Shown::Pane(i),
+            _ => Shown::Messages,
+        };
         // Result tab strip.
         egui::Panel::top(egui::Id::new(("result_tabs", &self.title))).exact_size(30.0).frame(egui::Frame::NONE).show(
             ui,
@@ -264,87 +414,65 @@ impl QueryTab {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(6.0);
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    for i in 0..self.panes.len() {
-                        let selected = !self.show_messages && self.active == i;
-                        let label =
-                            if self.panes.len() == 1 { "Result".to_string() } else { format!("Result {}", i + 1) };
-                        if result_tab(ui, &label, selected) {
-                            self.active = i;
-                            self.show_messages = false;
+                    for (i, label) in self.chip_labels().iter().enumerate() {
+                        if result_tab(ui, label, shown == Shown::Pane(i)) {
+                            self.shown = Shown::Pane(i);
                         }
                     }
                     let errors = self.messages.iter().filter(|(e, _)| *e).count();
                     let label = if errors > 0 { format!("Messages ({errors} error)") } else { "Messages".to_string() };
-                    if result_tab(ui, &label, self.show_messages) {
-                        self.show_messages = true;
+                    if result_tab(ui, &label, shown == Shown::Messages) {
+                        self.shown = Shown::Messages;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(8.0);
-                        if let Some(pane) = self.panes.get(self.active).filter(|_| !self.show_messages)
-                            && let Some(rs) = pane.output.rows()
-                        {
-                            if widgets::icon_button(ui, Icon::Export, "Export result…").clicked() {
-                                ctx.actions.push(Action::Export(ExportSource::Rows {
-                                    name: "query_result".into(),
-                                    table: ctx.dialect.quote_ident("query_result"),
-                                    columns: rs.columns.clone(),
-                                    rows: rs.rows.clone(),
-                                }));
+                        let Shown::Pane(i) = shown else { return };
+                        let pane = &self.panes[i];
+                        match (&pane.body, pane.output.rows()) {
+                            (PaneBody::Plan(view), _) => {
+                                ui.label(RichText::new(view.summary()).size(12.0).color(p.text_muted))
+                                    .on_hover_text(&pane.output.sql);
                             }
-                            let trunc = if rs.truncated { " (limited)" } else { "" };
-                            ui.label(
-                                RichText::new(format!(
-                                    "{}{trunc} · {}",
-                                    widgets::plural(rs.rows.len() as u64, "row"),
-                                    fmt_duration(pane.output.elapsed)
-                                ))
-                                .size(12.0)
-                                .color(p.text_muted),
-                            )
-                            .on_hover_text(&pane.output.sql);
+                            (PaneBody::Rows { .. }, Some(rs)) => {
+                                if widgets::icon_button(ui, Icon::Export, "Export result…").clicked() {
+                                    ctx.actions.push(Action::Export(ExportSource::Rows {
+                                        name: "query_result".into(),
+                                        table: ctx.dialect.quote_ident("query_result"),
+                                        columns: rs.columns.clone(),
+                                        rows: rs.rows.clone(),
+                                    }));
+                                }
+                                let trunc = if rs.truncated { " (limited)" } else { "" };
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}{trunc} · {}",
+                                        widgets::plural(rs.rows.len() as u64, "row"),
+                                        fmt_duration(pane.output.elapsed)
+                                    ))
+                                    .size(12.0)
+                                    .color(p.text_muted),
+                                )
+                                .on_hover_text(&pane.output.sql);
+                            }
+                            (PaneBody::Rows { .. }, None) => {}
                         }
                     });
                 });
             },
         );
 
-        if self.show_messages || self.panes.is_empty() {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.add_space(8.0);
-                if self.messages.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.add_space(14.0);
-                        ui.label(widgets::muted(
-                            ui,
-                            format!(
-                                "Write SQL above and press {} to run the statement under the cursor, or {} to run everything.",
-                                shortcut_label("↵"),
-                                shortcut_label("⇧↵")
-                            ),
-                        ));
-                    });
-                }
-                for (err, msg) in &self.messages {
-                    ui.horizontal_top(|ui| {
-                        ui.add_space(14.0);
-                        let (r, _) = ui.allocate_exact_size(vec2(8.0, 18.0), Sense::hover());
-                        ui.painter().circle_filled(r.center(), 4.0, if *err { p.danger } else { p.success });
-                        ui.add(egui::Label::new(RichText::new(msg).font(theme::mono_font(12.0)).color(if *err { p.danger } else { p.text })).wrap());
-                    });
-                    ui.add_space(4.0);
-                }
-                if let Some(t) = self.total_elapsed {
-                    ui.horizontal(|ui| {
-                        ui.add_space(14.0);
-                        ui.label(RichText::new(format!("Total time {}", fmt_duration(t))).size(11.5).color(p.text_faint));
-                    });
-                }
-            });
+        let Shown::Pane(active) = shown else {
+            self.messages_view(ui);
             return;
-        }
-
-        let active = self.active.min(self.panes.len() - 1);
+        };
         let pane = &mut self.panes[active];
+        let (grid_state, sort) = match &mut pane.body {
+            PaneBody::Plan(view) => {
+                plan_view::show(ui, egui::Id::new(("result_plan", &self.title, active)), view);
+                return;
+            }
+            PaneBody::Rows { grid, sort } => (grid, sort),
+        };
         let Some(rs) = (match &mut pane.output.result {
             StatementResult::Rows(rs) => Some(rs),
             StatementResult::Affected(_) => None,
@@ -352,19 +480,19 @@ impl QueryTab {
             return;
         };
         let id = egui::Id::new(("result_grid", &self.title, active));
-        let events = grid::show(ui, id, &mut pane.grid, &SortedData { inner: ResultData { rs }, sort: pane.sort });
+        let events = grid::show(ui, id, grid_state, &SortedData { inner: ResultData { rs }, sort: *sort });
         for ev in events {
             match ev {
                 GridEvent::Sort { col, .. } => {
-                    let desc = match pane.sort {
+                    let desc = match *sort {
                         Some((c, false)) if c == col => true,
                         Some((c, true)) if c == col => {
-                            pane.sort = None;
+                            *sort = None;
                             continue;
                         }
                         _ => false,
                     };
-                    pane.sort = Some((col, desc));
+                    *sort = Some((col, desc));
                     rs.rows.sort_by(|a, b| {
                         let o = cmp_values(&a[col], &b[col]);
                         if desc { o.reverse() } else { o }
@@ -383,6 +511,57 @@ impl QueryTab {
             }
         }
     }
+
+    fn messages_view(&self, ui: &mut Ui) {
+        let p = palette(ui);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.add_space(8.0);
+            if self.messages.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.label(widgets::muted(
+                        ui,
+                        format!(
+                            "Write SQL above and press {} to run the statement under the cursor, or {} to run everything. {} explains it, and {} explains it with measured times.",
+                            shortcut_label("↵"),
+                            shortcut_label("⇧↵"),
+                            shortcut_label("E"),
+                            shortcut_label("⇧E")
+                        ),
+                    ));
+                });
+            }
+            for (err, msg) in &self.messages {
+                ui.horizontal_top(|ui| {
+                    ui.add_space(14.0);
+                    let (r, _) = ui.allocate_exact_size(vec2(8.0, 18.0), Sense::hover());
+                    ui.painter().circle_filled(r.center(), 4.0, if *err { p.danger } else { p.success });
+                    ui.add(egui::Label::new(RichText::new(msg).font(theme::mono_font(12.0)).color(if *err { p.danger } else { p.text })).wrap());
+                });
+                ui.add_space(4.0);
+            }
+            if let Some(t) = self.total_elapsed {
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.label(RichText::new(format!("Total time {}", fmt_duration(t))).size(11.5).color(p.text_faint));
+                });
+            }
+        });
+    }
+}
+
+/// Explain Analyze falls back to the estimated plan, with a note saying why, where the server
+/// can't measure or where running the statement would change data.
+fn explain_job(server: &ServerInfo, sql: String, mode: ExplainMode) -> Job {
+    let (step, note) = match plan::request(server, &sql, mode) {
+        Ok(req) => (Ok(Step::Explain(req)), None),
+        Err(why) if mode == ExplainMode::Analyze => match plan::request(server, &sql, ExplainMode::Estimate) {
+            Ok(req) => (Ok(Step::Explain(req)), Some(format!("{why} Showing the estimated plan instead."))),
+            Err(e) => (Err(e.0), None),
+        },
+        Err(why) => (Err(why.0), None),
+    };
+    Job { sql, step, note }
 }
 
 fn result_tab(ui: &mut Ui, label: &str, selected: bool) -> bool {
@@ -479,6 +658,57 @@ mod tests {
         assert_eq!(v[3], Value::Int(10));
     }
 
+    fn explained(job: &Job) -> Option<&str> {
+        match &job.step {
+            Ok(Step::Explain(req)) => Some(req.explain.sql()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn explain_analyze_never_runs_a_write() {
+        use tableplus_core::plan::Explain;
+        use tableplus_core::{Flavor, Version};
+        let mysql = ServerInfo::new(Flavor::MySql, Version::new(8, 4, 11));
+        let job = explain_job(&mysql, "UPDATE products SET price = 0".into(), ExplainMode::Analyze);
+        assert_eq!(explained(&job), Some("EXPLAIN FORMAT=JSON UPDATE products SET price = 0"));
+        assert!(job.note.as_deref().is_some_and(|n| n.contains("UPDATE") && n.contains("estimated plan")));
+        assert_eq!(job.sql, "UPDATE products SET price = 0", "history keeps the user's statement");
+
+        let job = explain_job(&mysql, "select 1".into(), ExplainMode::Analyze);
+        assert_eq!((explained(&job), job.note.as_deref()), (Some("EXPLAIN ANALYZE FORMAT=JSON select 1"), None));
+
+        let sqlite = ServerInfo::new(Flavor::Sqlite, Version::new(3, 53, 2)).with_scan_status(true);
+        let job = explain_job(&sqlite, "select 1".into(), ExplainMode::Analyze);
+        assert!(matches!(&job.step, Ok(Step::Explain(r)) if r.explain == Explain::Measure("select 1".into())));
+        assert_eq!(job.note, None);
+        let job = explain_job(&sqlite, "delete from t".into(), ExplainMode::Analyze);
+        assert_eq!(explained(&job), Some("EXPLAIN QUERY PLAN delete from t"));
+        assert!(job.note.as_deref().is_some_and(|n| n.contains("DELETE") && n.contains("estimated plan")));
+
+        let job = explain_job(&mysql, "explain select 1".into(), ExplainMode::Estimate);
+        assert!(job.step.is_err());
+    }
+
+    #[test]
+    fn chips_number_results_and_plans_separately() {
+        let output =
+            || QueryOutput { sql: String::new(), result: StatementResult::Affected(0), elapsed: Duration::ZERO };
+        let rows = || ResultPane { output: output(), body: PaneBody::Rows { grid: Box::default(), sort: None } };
+        let plan = || ResultPane {
+            output: output(),
+            body: PaneBody::Plan(Box::new(PlanView::new(
+                PlanContent::Raw { text: String::new(), reason: String::new() },
+                None,
+            ))),
+        };
+        let mut t = QueryTab::new("q".into(), String::new());
+        t.panes = vec![rows(), plan(), rows()];
+        assert_eq!(t.chip_labels(), ["Result 1", "Plan", "Result 2"]);
+        t.panes = vec![plan(), plan()];
+        assert_eq!(t.chip_labels(), ["Plan 1", "Plan 2"]);
+    }
+
     #[test]
     fn picks_statements() {
         let mut t = QueryTab::new("q".into(), "select 1;\nselect 2;\nselect 3".into());
@@ -487,5 +717,10 @@ mod tests {
         assert_eq!(t.statements_to_run(Dialect::Postgres, true).len(), 3);
         t.selection = Some((0, 18));
         assert_eq!(t.statements_to_run(Dialect::Postgres, false), vec!["select 1", "select 2"]);
+        let pasted = QueryTab::new("q".into(), "select 1;\n\u{a0}\u{a0}select 2;\u{a0};delete from t\u{a0}".into());
+        assert_eq!(
+            pasted.statements_to_run(Dialect::Postgres, true),
+            vec!["select 1", "select 2", "delete from t\u{a0}"]
+        );
     }
 }
